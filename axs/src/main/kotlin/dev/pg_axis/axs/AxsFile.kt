@@ -8,7 +8,7 @@ import kotlin.reflect.full.memberProperties
 
 class AxsFile(private val filePath: String) {
   private val MAGIC = byteArrayOf(0x41, 0x58, 0x53, 0x1A)
-  private val VERSION: Byte = 1
+  private val VERSION: Byte = 2
   private val HEADER_SIZE = 16L
   private val BLOCK_HEADER_SIZE = 10
   private val DEFAULT_CHUNK_SIZE = 4096
