@@ -11,11 +11,10 @@ dependencies {
 }
 
 application {
-    // Define the main class for the application.
-    mainClass = "dev.pg_axis.axs.cli.MainKt"
-    applicationName = "axs"
+  mainClass = "dev.pg_axis.axs.cli.MainKt"
+  applicationName = "axs"
 }
 
 tasks.named<Jar>("jar") {
-    archiveBaseName = "axs-lib"
+  archiveBaseName = "axs-lib"
 }
