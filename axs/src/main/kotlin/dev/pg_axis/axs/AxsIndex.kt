@@ -8,7 +8,7 @@ enum class NodeType(val value: Byte) {
 }
 
 enum class ValueType(val value: Byte) {
-  STRING(0), INT(1), FLOAT(2), BOOL(3);
+  STRING(0), INT(1), FLOAT(2), BOOL(3), DOUBLE(4), LONG(5), SHORT(6), CHAR(7), BYTE(8);
   companion object { fun from(b: Byte) = entries.first { it.value == b } }
 }
 

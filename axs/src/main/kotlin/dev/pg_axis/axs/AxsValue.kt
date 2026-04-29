@@ -18,6 +18,22 @@ data class AxsBool(val value: Boolean): AxsValue() {
   override fun toString() = value.toString()
 }
 
+data class AxsDouble(val value: Double) : AxsValue() {
+    override fun toString() = value.toString()
+}
+data class AxsLong(val value: Long) : AxsValue() {
+    override fun toString() = value.toString()
+}
+data class AxsShort(val value: Short) : AxsValue() {
+    override fun toString() = value.toString()
+}
+data class AxsChar(val value: Char) : AxsValue() {
+    override fun toString() = value.toString()
+}
+data class AxsByte(val value: Byte) : AxsValue() {
+    override fun toString() = value.toString()
+}
+
 data class AxsObject(val children: Map<String, AxsValue>): AxsValue() {
   override fun toString() = toJson(0)
   fun toJson(indent: Int): String {
@@ -45,6 +61,11 @@ fun valueToJson(value: AxsValue, indent: Int = 0): String = when (value) {
   is AxsInt -> value.value.toString()
   is AxsFloat -> value.value.toString()
   is AxsBool -> value.value.toString()
+  is AxsDouble -> value.value.toString()
+  is AxsLong -> value.value.toString()
+  is AxsShort -> value.value.toString()
+  is AxsChar -> "\"${value.value}\""
+  is AxsByte -> value.value.toString()
   is AxsObject -> value.toJson(indent)
   is AxsArray -> value.toJson(indent)
 }
@@ -52,7 +73,11 @@ fun valueToJson(value: AxsValue, indent: Int = 0): String = when (value) {
 fun axsValueOf(value: String) = AxsString(value)
 fun axsValueOf(value: Int) = AxsInt(value)
 fun axsValueOf(value: Float) = AxsFloat(value)
-fun axsValueOf(value: Double) = AxsFloat(value.toFloat())
 fun axsValueOf(value: Boolean) = AxsBool(value)
+fun axsValueOf(value: Double) = AxsDouble(value)
+fun axsValueOf(value: Long) = AxsLong(value)
+fun axsValueOf(value: Short) = AxsShort(value)
+fun axsValueOf(value: Char) = AxsChar(value)
+fun axsValueOf(value: Byte) = AxsByte(value)
 fun axsValueOf(value: List<AxsValue>) = AxsArray(value)
 fun axsValueOf(value: Map<String, AxsValue>) = AxsObject(value)
