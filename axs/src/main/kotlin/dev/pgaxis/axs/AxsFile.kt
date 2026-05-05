@@ -1,4 +1,4 @@
-package dev.pg_axis.axs
+package dev.pgaxis.axs
 
 import java.io.File
 import java.io.RandomAccessFile
@@ -8,7 +8,7 @@ import kotlin.reflect.full.memberProperties
 
 class AxsFile(private val filePath: String) {
   private val MAGIC = byteArrayOf(0x41, 0x58, 0x53, 0x1A)
-  private val VERSION: Byte = 2
+  private val VERSION: Byte = 3
   private val HEADER_SIZE = 16L
   private val BLOCK_HEADER_SIZE = 10
   private val DEFAULT_CHUNK_SIZE = 4096

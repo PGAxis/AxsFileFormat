@@ -1,4 +1,4 @@
-package dev.pg_axis.axs
+package dev.pgaxis.axs
 
 class AxsFileNotOpenException(filePath: String) :
   Exception("AXS file is not open: $filePath")

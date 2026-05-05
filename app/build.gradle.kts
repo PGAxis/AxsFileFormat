@@ -11,7 +11,7 @@ dependencies {
 }
 
 application {
-  mainClass = "dev.pg_axis.axs.cli.MainKt"
+  mainClass = "dev.pgaxis.axs.cli.MainKt"
   applicationName = "axs"
 }
 

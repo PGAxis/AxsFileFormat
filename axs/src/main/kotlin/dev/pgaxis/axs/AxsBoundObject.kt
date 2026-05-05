@@ -1,4 +1,4 @@
-package dev.pg_axis.axs
+package dev.pgaxis.axs
 
 import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.KProperty1
