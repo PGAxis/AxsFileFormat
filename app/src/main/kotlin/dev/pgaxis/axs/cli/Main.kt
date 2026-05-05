@@ -1,6 +1,6 @@
-package dev.pg_axis.axs.cli
+package dev.pgaxis.axs.cli
 
-import dev.pg_axis.axs.*
+import dev.pgaxis.axs.*
 
 fun main(args: Array<String>) {
   if (args.isEmpty()) {

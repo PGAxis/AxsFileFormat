@@ -1,4 +1,4 @@
-package dev.pg_axis.axs
+package dev.pgaxis.axs
 
 import java.io.File
 import java.io.RandomAccessFile
