@@ -16,7 +16,26 @@ class AxsFile(private val filePath: String) {
   private var isFileOpen: Boolean = false
 
   fun open() {
-    if (!File(filePath).exists()) create()
+    if (!File(filePath).exists()) {
+      create()
+      isFileOpen = true
+      return
+    }
+    
+    val file = RandomAccessFile(filePath, "r")
+    file.use {
+      val magic = ByteArray(4)
+      it.readFully(magic)
+      if (!magic.contentEquals(MAGIC)) {
+        throw AxsFileCorruptException(filePath, "invalid magic bytes")
+      }
+
+      val version = it.readByte()
+      if (version > VERSION) {
+        throw AxsFileCorruptException(filePath, "unsupported version $version")
+      }
+    }
+
     isFileOpen = true
   }
 
@@ -40,6 +59,7 @@ class AxsFile(private val filePath: String) {
     if (get(className) == null) {
       createObject(className)
       for (prop in instance::class.memberProperties) {
+        @Suppress("UNCHECKED_CAST")
         val value = (prop as KProperty1<T, *>).get(instance)
         if (value != null) set("$className.${prop.name}", value.toAxsValue())
       }
@@ -98,9 +118,19 @@ class AxsFile(private val filePath: String) {
   private fun readNode(file: RandomAccessFile, index: AxsIndex, node: AxsNode, path: String): AxsValue {
     return when (node.nodeType) {
       NodeType.VALUE -> {
-        file.seek(node.dataOffset + 10)
+        file.seek(node.dataOffset + 4)
+        val storedType = file.readByte()
+        file.readByte()
+        val storedCrc = file.readInt()
+
         val dataBytes = ByteArray(node.dataSize)
         file.readFully(dataBytes)
+
+        val actualCrc = CRC32().apply { update(dataBytes) }.value.toInt()
+        if (actualCrc != storedCrc) {
+          throw AxsFileCorruptException(filePath, "CRC mismatch at path: $path")
+        }
+
         val raw = String(dataBytes, Charsets.UTF_8)
         when (node.valueType) {
           ValueType.STRING -> AxsString(raw)

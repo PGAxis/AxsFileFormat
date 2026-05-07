@@ -99,6 +99,29 @@ fun main(args: Array<String>) {
       println(valueToJson(file.get("meta")!!))
       file.close()
     }
+    "bind-test" -> {
+      data class AppSettings(
+        var darkMode: Boolean = true,
+        var fontSize: Int = 14,
+        var username: String = "Axis",
+        var volume: Float = 0.8f
+      )
+
+      val file = AxsFile("bind_test.axs")
+      file.open()
+      val settings = file.bind(AppSettings())
+
+      println("Before:")
+      println(valueToJson(file.get("AppSettings")!!))
+
+      settings.setValue(AppSettings::darkMode, false)
+      settings.setValue(AppSettings::fontSize, 16)
+
+      println("After:")
+      println(valueToJson(file.get("AppSettings")!!))
+
+      file.close()
+    }
     else -> println("Unknown command: ${args[0]}")
   }
 }
