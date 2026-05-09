@@ -3,11 +3,11 @@
  */
 
 plugins {
-    id("buildlogic.kotlin-application-conventions")
+  id("buildlogic.kotlin-application-conventions")
 }
 
 dependencies {
-    implementation(project(":axs"))
+  implementation(project(":axs"))
 }
 
 application {

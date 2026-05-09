@@ -3,9 +3,63 @@
  */
 
 plugins {
-    id("buildlogic.kotlin-library-conventions")
+  id("buildlogic.kotlin-library-conventions")
+  id("maven-publish")
+  id("signing")
 }
 
 dependencies {
-    implementation(kotlin("reflect"))
+  implementation(kotlin("reflect"))
+}
+
+java {
+  withSourcesJar()
+  withJavadocJar()
+}
+
+publishing {
+  publications {
+    create<MavenPublication>("mavenJava") {
+      from(components["java"])
+
+      groupId = "dev.pgaxis"
+      artifactId = "axs"
+      version = "1.0.0"
+
+      pom {
+        name = "AXS — Axis Xtensible Settings"
+        description = "File format (and a library) for all types of settings"
+        url = "https://axs.pgaxis.dev"
+
+        licenses {
+          license {
+            name = "GNU Affero General Public License v3.0"
+            url = "https://www.gnu.org/licenses/agpl-3.0.html"
+          }
+        }
+
+        developers {
+          developer {
+            id = "pgaxis"
+            name = "Jan Sixta"
+            email = "pgaxis.dev@gmail.com"
+          }
+        }
+
+        scm {
+          connection = "scm:git:git://github.com/PGAxis/AxsFileFormat.git"
+          developerConnection = "scm:git:ssh://github.com/PGAxis/AxsFileFormat.git"
+          url = "https://github.com/PGAxis/AxsFileFormat"
+        }
+      }
+    }
+  }
+}
+
+signing {
+  val keyFile = project.findProperty("signing.secretKeyRingFile") as String?
+  val keyId = project.findProperty("signing.keyId") as String?
+  val password = project.findProperty("signing.password") as String?
+  useInMemoryPgpKeys(keyId, rootProject.file(keyFile!!).readText(), password)
+  sign(publishing.publications["mavenJava"])
 }
