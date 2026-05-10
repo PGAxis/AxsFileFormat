@@ -4,6 +4,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.util.zip.CRC32
 import kotlin.reflect.KProperty1
+import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.full.memberProperties
 
 class AxsFile(private val filePath: String) {
@@ -62,6 +63,31 @@ class AxsFile(private val filePath: String) {
         @Suppress("UNCHECKED_CAST")
         val value = (prop as KProperty1<T, *>).get(instance)
         if (value != null) set("$className.${prop.name}", value.toAxsValue())
+      }
+    } else {
+      // Already exists - load saved values into instance
+      val saved = get(className) as? AxsObject
+      saved?.let {
+        for (prop in instance::class.memberProperties.filterIsInstance<KMutableProperty1<T, *>>()) {
+          val key = prop.name
+          val axsValue = it.children[key] ?: continue
+          val converted: Any? = when (prop.returnType.classifier) {
+            String::class -> (axsValue as? AxsString)?.value
+            Int::class -> (axsValue as? AxsInt)?.value
+            Float::class -> (axsValue as? AxsFloat)?.value
+            Double::class -> (axsValue as? AxsDouble)?.value
+            Boolean::class -> (axsValue as? AxsBool)?.value
+            Long::class -> (axsValue as? AxsLong)?.value
+            Short::class -> (axsValue as? AxsShort)?.value
+            Char::class -> (axsValue as? AxsChar)?.value
+            Byte::class -> (axsValue as? AxsByte)?.value
+            else -> null
+          }
+          if (converted != null) {
+            @Suppress("UNCHECKED_CAST")
+            (prop as KMutableProperty1<T, Any>).set(instance, converted)
+          }
+        }
       }
     }
 
