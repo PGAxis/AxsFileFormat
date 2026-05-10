@@ -1,6 +1,14 @@
 package dev.pgaxis.axs
 
+import kotlin.reflect.KMutableProperty1
+import kotlin.reflect.full.findAnnotation
+import kotlin.reflect.full.memberProperties
+
 sealed class AxsValue
+
+@Target(AnnotationTarget.PROPERTY)
+@Retention(AnnotationRetention.RUNTIME)
+annotation class AxsKey(val name: String)
 
 data class AxsString(val value: String): AxsValue() {
   override fun toString() = value
@@ -43,6 +51,38 @@ data class AxsObject(val children: Map<String, AxsValue>): AxsValue() {
       "$inner\"$k\":${valueToJson(v, indent + 1)}"
     }
   }
+}
+
+inline fun <reified T : Any> AxsObject.toDataClass(default: T): T {
+  val props = T::class.memberProperties
+    .filterIsInstance<KMutableProperty1<T, *>>()
+
+  val result = default
+
+  for (prop in props) {
+    val key = prop.findAnnotation<AxsKey>()?.name ?: prop.name
+    val axsValue = children[key] ?: continue // use default if missing
+
+    val converted: Any? = when (prop.returnType.classifier) {
+      String::class -> (axsValue as? AxsString)?.value
+      Int::class -> (axsValue as? AxsInt)?.value
+      Float::class -> (axsValue as? AxsFloat)?.value
+      Double::class -> (axsValue as? AxsDouble)?.value
+      Boolean::class -> (axsValue as? AxsBool)?.value
+      Long::class -> (axsValue as? AxsLong)?.value
+      Short::class -> (axsValue as? AxsShort)?.value
+      Char::class -> (axsValue as? AxsChar)?.value
+      Byte::class -> (axsValue as? AxsByte)?.value
+      else -> null
+    }
+
+    if (converted != null) {
+      @Suppress("UNCHECKED_CAST")
+      (prop as KMutableProperty1<T, Any>).set(result, converted)
+    }
+  }
+
+  return result
 }
 
 data class AxsArray(val items: List<AxsValue>): AxsValue() {

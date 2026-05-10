@@ -19,6 +19,8 @@ class AxsBoundObject<T : Any>(
     file.set("$className.${prop.name}", value.toAxsCompatibleValue())
   }
 
+  fun get(): T = instance
+
   private fun Any.toAxsCompatibleValue(): AxsValue = when (this) {
     is String -> axsValueOf(this)
     is Int -> axsValueOf(this)
