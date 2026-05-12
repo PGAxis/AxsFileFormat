@@ -1,6 +1,9 @@
 package dev.pgaxis.axs.cli
 
 import dev.pgaxis.axs.*
+import java.io.File
+
+enum class Theme { LIGHT, DARK, SYSTEM }
 
 fun main(args: Array<String>) {
   if (args.isEmpty()) {
@@ -121,6 +124,47 @@ fun main(args: Array<String>) {
       println(valueToJson(file.get("AppSettings")!!))
 
       file.close()
+    }
+    "bind-reflect-test" -> {
+      data class FontSettings(val size: Int = 12, val bold: Boolean = false)
+      data class AppConfig(
+        var theme: Theme = Theme.DARK,
+        var font: FontSettings = FontSettings(),
+        var recentFiles: List<String> = emptyList()
+      )
+
+      val filePath = "bind_reflect_test.axs"
+      File(filePath).delete() // start fresh
+
+      // --- Write ---
+      val file = AxsFile(filePath)
+      file.open()
+      val bound = file.bind(AppConfig(
+        theme = Theme.SYSTEM,
+        font = FontSettings(size = 16, bold = true),
+        recentFiles = listOf("foo.mp3", "bar.mp3", "baz.mp3")
+      ))
+      println("Written:")
+      println(valueToJson(file.get("AppConfig")!!))
+      file.close()
+
+      // --- Read back ---
+      val file2 = AxsFile(filePath)
+      file2.open()
+      val loaded = file2.bind(AppConfig())
+      val config = loaded.get()
+      println("\nRead back:")
+      println("  theme       = ${config.theme}  (expected SYSTEM)")
+      println("  font.size   = ${config.font.size}  (expected 16)")
+      println("  font.bold   = ${config.font.bold}  (expected true)")
+      println("  recentFiles = ${config.recentFiles}  (expected [foo.mp3, bar.mp3, baz.mp3])")
+      file2.close()
+
+      val ok = config.theme == Theme.SYSTEM
+        && config.font.size == 16
+        && config.font.bold == true
+        && config.recentFiles == listOf("foo.mp3", "bar.mp3", "baz.mp3")
+      println(if (ok) "\nPASS" else "\nFAIL")
     }
     else -> println("Unknown command: ${args[0]}")
   }
