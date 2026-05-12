@@ -31,6 +31,21 @@ class AxsBoundObject<T : Any>(
     is Short -> axsValueOf(this)
     is Char -> axsValueOf(this)
     is Byte -> axsValueOf(this)
-    else -> throw AxsTypeMismatchException(className, this::class.simpleName ?: "unknown", "supported type")
+    is List<*> -> AxsArray(this.map {
+        (it as? String)?.let { s -> axsValueOf(s) }
+            ?: throw AxsTypeMismatchException(className, it?.let { it::class.simpleName } ?: "null", "supported type")
+    })
+    is Enum<*> -> axsValueOf(this.name)
+    else -> {
+        val props = this::class.memberProperties
+        if (props.isEmpty()) throw AxsTypeMismatchException(className, this::class.simpleName ?: "unknown", "supported type")
+        val children = props.associate { prop ->
+            @Suppress("UNCHECKED_CAST")
+            val value = (prop as KProperty1<Any, *>).get(this)
+            prop.name to (value?.toAxsCompatibleValue()
+                ?: throw AxsTypeMismatchException(className, "null", "supported type"))
+        }
+        AxsObject(children)
+    }
   }
 }
