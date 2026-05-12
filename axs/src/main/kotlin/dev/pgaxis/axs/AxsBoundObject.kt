@@ -3,6 +3,7 @@ package dev.pgaxis.axs
 import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.KProperty1
 import kotlin.reflect.full.memberProperties
+import kotlinx.coroutines.*
 
 class AxsBoundObject<T : Any>(
   private val file: AxsFile,
