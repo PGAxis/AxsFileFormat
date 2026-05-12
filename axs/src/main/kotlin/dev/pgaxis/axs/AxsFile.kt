@@ -6,6 +6,8 @@ import java.util.zip.CRC32
 import kotlin.reflect.KProperty1
 import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.full.memberProperties
+import kotlin.reflect.KClass
+import kotlin.reflect.full.primaryConstructor
 
 class AxsFile(private val filePath: String) {
   private val MAGIC = byteArrayOf(0x41, 0x58, 0x53, 0x1A)
@@ -81,7 +83,37 @@ class AxsFile(private val filePath: String) {
             Short::class -> (axsValue as? AxsShort)?.value
             Char::class -> (axsValue as? AxsChar)?.value
             Byte::class -> (axsValue as? AxsByte)?.value
-            else -> null
+            List::class -> (axsValue as? AxsArray)?.items?.map { (it as AxsString).value }
+            else -> {
+              val classifier = prop.returnType.classifier
+              if (classifier is KClass<*>) {
+                if (classifier.java.isEnum) {
+                  val enumValue = (axsValue as? AxsString)?.value
+                  classifier.java.enumConstants?.firstOrNull {
+                    (it as Enum<*>).name == enumValue
+                  }
+                } else {
+                  val obj = axsValue as? AxsObject ?: return@let null
+                  val constructor = classifier.primaryConstructor ?: return@let null
+                  val args = constructor.parameters.associateWith { param ->
+                    val child = obj.children[param.name] ?: return@let null
+                    when (param.type.classifier) {
+                      String::class -> (child as? AxsString)?.value
+                      Int::class -> (child as? AxsInt)?.value
+                      Float::class -> (child as? AxsFloat)?.value
+                      Double::class -> (child as? AxsDouble)?.value
+                      Boolean::class -> (child as? AxsBool)?.value
+                      Long::class -> (child as? AxsLong)?.value
+                      Short::class -> (child as? AxsShort)?.value
+                      Char::class -> (child as? AxsChar)?.value
+                      Byte::class -> (child as? AxsByte)?.value
+                      else -> null
+                    }
+                  }
+                  constructor.callBy(args)
+                }
+              } else null
+            }
           }
           if (converted != null) {
             @Suppress("UNCHECKED_CAST")
@@ -105,7 +137,21 @@ class AxsFile(private val filePath: String) {
     is Short -> axsValueOf(this)
     is Char -> axsValueOf(this)
     is Byte -> axsValueOf(this)
-    else -> throw AxsTypeMismatchException("", this::class.simpleName ?: "unknown", "supported type")
+    is List<*> -> AxsArray(this.map { 
+      (it as? String)?.let { s -> axsValueOf(s) } ?: throw AxsTypeMismatchException("", it?.let { it::class.simpleName } ?: "null", "supported type")
+    })
+    is Enum<*> -> axsValueOf(this.name)
+    else -> {
+      // Try to serialize as object using reflection
+      val props = this::class.memberProperties
+      if (props.isEmpty()) throw AxsTypeMismatchException("", this::class.simpleName ?: "unknown", "supported type")
+      val children = props.associate { prop ->
+        @Suppress("UNCHECKED_CAST")
+        val value = (prop as KProperty1<Any, *>).get(this)
+        prop.name to (value?.toAxsValue() ?: throw AxsTypeMismatchException("", "null", "supported type"))
+      }
+      AxsObject(children)
+    }
   }
 
   private fun shiftData(file: RandomAccessFile, fromOffset: Long, byBytes: Long, chunkSize: Int = DEFAULT_CHUNK_SIZE) {
