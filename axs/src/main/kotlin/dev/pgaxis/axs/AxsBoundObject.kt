@@ -4,6 +4,8 @@ import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.KProperty1
 import kotlin.reflect.full.memberProperties
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class AxsBoundObject<T : Any>(
   private val file: AxsFile,
@@ -11,6 +13,7 @@ class AxsBoundObject<T : Any>(
   private val className: String
 ) {
   private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+  private val mutex = Mutex()
   private val writeJobs = mutableMapOf<String, Job>()
 
   fun <V> getValue(prop: KProperty1<T, V>): V {
@@ -20,12 +23,14 @@ class AxsBoundObject<T : Any>(
   fun <V : Any> setValue(prop: KMutableProperty1<T, V>, value: V) {
     if (!file.isOpen()) throw AxsFileNotOpenException(className)
     prop.set(instance, value)
-    
+
     val key = prop.name
     writeJobs[key]?.cancel()
     writeJobs[key] = scope.launch {
-      delay(100) // "debounce"
-      file.set("$className.$key", value.toAxsCompatibleValue())
+      delay(100)
+      mutex.withLock {
+        file.set("$className.$key", value.toAxsCompatibleValue())
+      }
     }
   }
 

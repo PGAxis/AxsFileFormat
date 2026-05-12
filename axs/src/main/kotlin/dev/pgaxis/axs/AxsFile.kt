@@ -8,6 +8,9 @@ import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.full.memberProperties
 import kotlin.reflect.KClass
 import kotlin.reflect.full.primaryConstructor
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class AxsFile(private val filePath: String) {
   private val MAGIC = byteArrayOf(0x41, 0x58, 0x53, 0x1A)
@@ -15,6 +18,7 @@ class AxsFile(private val filePath: String) {
   private val HEADER_SIZE = 16L
   private val BLOCK_HEADER_SIZE = 10
   private val DEFAULT_CHUNK_SIZE = 4096
+  private val fileMutex = Mutex()
 
   private var isFileOpen: Boolean = false
 
@@ -24,7 +28,7 @@ class AxsFile(private val filePath: String) {
       isFileOpen = true
       return
     }
-    
+
     val file = RandomAccessFile(filePath, "r")
     file.use {
       val magic = ByteArray(4)
@@ -58,7 +62,6 @@ class AxsFile(private val filePath: String) {
     val className = instance::class.simpleName
       ?: throw IllegalArgumentException("Cannot bind anonymous class")
 
-    // Create object in file if it doesn't exist
     if (get(className) == null) {
       createObject(className)
       for (prop in instance::class.memberProperties) {
@@ -67,7 +70,6 @@ class AxsFile(private val filePath: String) {
         if (value != null) set("$className.${prop.name}", value.toAxsValue())
       }
     } else {
-      // Already exists - load saved values into instance
       val saved = get(className) as? AxsObject
       saved?.let {
         for (prop in instance::class.memberProperties.filterIsInstance<KMutableProperty1<T, *>>()) {
@@ -137,12 +139,11 @@ class AxsFile(private val filePath: String) {
     is Short -> axsValueOf(this)
     is Char -> axsValueOf(this)
     is Byte -> axsValueOf(this)
-    is List<*> -> AxsArray(this.map { 
+    is List<*> -> AxsArray(this.map {
       (it as? String)?.let { s -> axsValueOf(s) } ?: throw AxsTypeMismatchException("", it?.let { it::class.simpleName } ?: "null", "supported type")
     })
     is Enum<*> -> axsValueOf(this.name)
     else -> {
-      // Try to serialize as object using reflection
       val props = this::class.memberProperties
       if (props.isEmpty()) throw AxsTypeMismatchException("", this::class.simpleName ?: "unknown", "supported type")
       val children = props.associate { prop ->
@@ -256,36 +257,38 @@ class AxsFile(private val filePath: String) {
   }
 
   private fun createNode(path: String, nodeType: NodeType) {
-    val file = RandomAccessFile(filePath, "rw")
-    file.use {
-      it.skipBytes(4)
-      it.readByte()
-      val indexOffset = it.readLong()
-      val index = AxsIndex()
-      index.readFrom(it, indexOffset)
+    runBlocking { fileMutex.withLock {
+      val file = RandomAccessFile(filePath, "rw")
+      file.use {
+        it.skipBytes(4)
+        it.readByte()
+        val indexOffset = it.readLong()
+        val index = AxsIndex()
+        index.readFrom(it, indexOffset)
 
-      val segments = path.split(".")
-      var currentParentId = AxsIndex.ROOT_ID
-      for (i in 0 until segments.size - 1) {
-        val segment = segments[i]
-        val segmentPath = segments.subList(0, i + 1).joinToString(".")
-        val segmentId = AxsIndex.hashPath(segmentPath)
-        if (index.find(segmentId) == null) {
+        val segments = path.split(".")
+        var currentParentId = AxsIndex.ROOT_ID
+        for (i in 0 until segments.size - 1) {
+          val segment = segments[i]
+          val segmentPath = segments.subList(0, i + 1).joinToString(".")
+          val segmentId = AxsIndex.hashPath(segmentPath)
+          if (index.find(segmentId) == null) {
             index.add(AxsNode(id = segmentId, parentId = currentParentId, nodeType = NodeType.OBJECT, name = segment))
+          }
+          currentParentId = segmentId
         }
-        currentParentId = segmentId
+
+        val nodeId = AxsIndex.hashPath(path)
+        if (index.find(nodeId) != null) return@withLock
+
+        index.add(AxsNode(id = nodeId, parentId = currentParentId, nodeType = nodeType, name = segments.last()))
+
+        it.seek(indexOffset)
+        index.writeTo(it)
+        it.seek(5)
+        it.writeLong(indexOffset)
       }
-
-      val nodeId = AxsIndex.hashPath(path)
-      if (index.find(nodeId) != null) return
-
-      index.add(AxsNode(id = nodeId, parentId = currentParentId, nodeType = nodeType, name = segments.last()))
-
-      it.seek(indexOffset)
-      index.writeTo(it)
-      it.seek(5)
-      it.writeLong(indexOffset)
-    }
+    }}
   }
 
   private fun validateDir(dir: File, isArray: Boolean): List<String> {
@@ -415,100 +418,104 @@ class AxsFile(private val filePath: String) {
 
   fun set(path: String, value: String, valueType: ValueType = ValueType.STRING) {
     checkOpen()
-    val file = RandomAccessFile(filePath, "rw")
-    file.use {
-      val magic = ByteArray(4)
-      it.readFully(magic)
-      it.readByte()
-      val indexOffset = it.readLong()
-      val index = AxsIndex()
-      index.readFrom(it, indexOffset)
+    runBlocking { fileMutex.withLock {
+      val file = RandomAccessFile(filePath, "rw")
+      file.use {
+        val magic = ByteArray(4)
+        it.readFully(magic)
+        it.readByte()
+        val indexOffset = it.readLong()
+        val index = AxsIndex()
+        index.readFrom(it, indexOffset)
 
-      val segments = path.split(".")
-      var currentParentId = AxsIndex.ROOT_ID
-      for (i in 0 until segments.size - 1) {
-        val segment = segments[i]
-        val segmentPath = segments.subList(0, i + 1).joinToString(".")
-        val segmentId = AxsIndex.hashPath(segmentPath)
-        if (index.find(segmentId) == null) {
-          index.add(AxsNode(id = segmentId, parentId = currentParentId, nodeType = NodeType.OBJECT, name = segment))
-        }
-        currentParentId = segmentId
-      }
-
-      val dataBytes = value.toByteArray(Charsets.UTF_8)
-      val crc = CRC32().apply { update(dataBytes) }.value.toInt()
-      val finalSegment = segments.last()
-      val nodeId = AxsIndex.hashPath(path)
-      val existingNode = index.find(nodeId)
-
-      if (existingNode == null) {
-        it.seek(indexOffset)
-        it.writeInt(dataBytes.size)
-        it.writeByte(valueType.value.toInt())
-        it.writeByte(0)
-        it.writeInt(crc)
-        it.write(dataBytes)
-
-        index.add(AxsNode(id = nodeId, parentId = currentParentId, nodeType = NodeType.VALUE,
-          name = finalSegment, dataOffset = indexOffset, dataSize = dataBytes.size, valueType = valueType))
-
-        val newIndexOffset = indexOffset + BLOCK_HEADER_SIZE + dataBytes.size
-        it.seek(newIndexOffset)
-        index.writeTo(it)
-        it.seek(5)
-        it.writeLong(newIndexOffset)
-
-      } else if (dataBytes.size == existingNode.dataSize) {
-        it.seek(existingNode.dataOffset + 6)
-        it.writeInt(crc)
-        it.write(dataBytes)
-        it.seek(existingNode.dataOffset + 4)
-        it.writeByte(valueType.value.toInt())
-        existingNode.valueType = valueType
-
-      } else {
-        val oldBlockSize = BLOCK_HEADER_SIZE + existingNode.dataSize
-        val newBlockSize = BLOCK_HEADER_SIZE + dataBytes.size
-        val diff = (newBlockSize - oldBlockSize).toLong()
-
-        shiftData(it, existingNode.dataOffset + oldBlockSize, diff)
-
-        it.seek(existingNode.dataOffset)
-        it.writeInt(dataBytes.size)
-        it.writeByte(valueType.value.toInt())
-        it.writeByte(0)
-        it.writeInt(crc)
-        it.write(dataBytes)
-
-        for (node in index.all()) {
-          if (node.nodeType == NodeType.VALUE && node.dataOffset > existingNode.dataOffset)
-                node.dataOffset += diff
+        val segments = path.split(".")
+        var currentParentId = AxsIndex.ROOT_ID
+        for (i in 0 until segments.size - 1) {
+          val segment = segments[i]
+          val segmentPath = segments.subList(0, i + 1).joinToString(".")
+          val segmentId = AxsIndex.hashPath(segmentPath)
+          if (index.find(segmentId) == null) {
+            index.add(AxsNode(id = segmentId, parentId = currentParentId, nodeType = NodeType.OBJECT, name = segment))
+          }
+          currentParentId = segmentId
         }
 
-        existingNode.dataSize = dataBytes.size
-        existingNode.valueType = valueType
+        val dataBytes = value.toByteArray(Charsets.UTF_8)
+        val crc = CRC32().apply { update(dataBytes) }.value.toInt()
+        val finalSegment = segments.last()
+        val nodeId = AxsIndex.hashPath(path)
+        val existingNode = index.find(nodeId)
 
-        val newIndexOffset = indexOffset + diff
-        it.seek(newIndexOffset)
-        index.writeTo(it)
-        it.seek(5)
-        it.writeLong(newIndexOffset)
+        if (existingNode == null) {
+          it.seek(indexOffset)
+          it.writeInt(dataBytes.size)
+          it.writeByte(valueType.value.toInt())
+          it.writeByte(0)
+          it.writeInt(crc)
+          it.write(dataBytes)
+
+          index.add(AxsNode(id = nodeId, parentId = currentParentId, nodeType = NodeType.VALUE,
+            name = finalSegment, dataOffset = indexOffset, dataSize = dataBytes.size, valueType = valueType))
+
+          val newIndexOffset = indexOffset + BLOCK_HEADER_SIZE + dataBytes.size
+          it.seek(newIndexOffset)
+          index.writeTo(it)
+          it.seek(5)
+          it.writeLong(newIndexOffset)
+
+        } else if (dataBytes.size == existingNode.dataSize) {
+          it.seek(existingNode.dataOffset + 6)
+          it.writeInt(crc)
+          it.write(dataBytes)
+          it.seek(existingNode.dataOffset + 4)
+          it.writeByte(valueType.value.toInt())
+          existingNode.valueType = valueType
+
+        } else {
+          val oldBlockSize = BLOCK_HEADER_SIZE + existingNode.dataSize
+          val newBlockSize = BLOCK_HEADER_SIZE + dataBytes.size
+          val diff = (newBlockSize - oldBlockSize).toLong()
+
+          shiftData(it, existingNode.dataOffset + oldBlockSize, diff)
+
+          it.seek(existingNode.dataOffset)
+          it.writeInt(dataBytes.size)
+          it.writeByte(valueType.value.toInt())
+          it.writeByte(0)
+          it.writeInt(crc)
+          it.write(dataBytes)
+
+          for (node in index.all()) {
+            if (node.nodeType == NodeType.VALUE && node.dataOffset > existingNode.dataOffset)
+              node.dataOffset += diff
+          }
+
+          existingNode.dataSize = dataBytes.size
+          existingNode.valueType = valueType
+
+          val newIndexOffset = indexOffset + diff
+          it.seek(newIndexOffset)
+          index.writeTo(it)
+          it.seek(5)
+          it.writeLong(newIndexOffset)
+        }
       }
-    }
+    }}
   }
 
   fun set(path: String, value: AxsValue) {
     checkOpen()
     val existing = get(path)
     if (existing != null) {
-      val file = RandomAccessFile(filePath, "r")
-      val index = AxsIndex()
-      file.use {
-        it.skipBytes(4); it.readByte()
-        index.readFrom(it, it.readLong())
-      }
-      val node = index.find(AxsIndex.hashPath(path))
+      val node = runBlocking { fileMutex.withLock {
+        val file = RandomAccessFile(filePath, "r")
+        val index = AxsIndex()
+        file.use {
+          it.skipBytes(4); it.readByte()
+          index.readFrom(it, it.readLong())
+        }
+        index.find(AxsIndex.hashPath(path))
+      }}
       if (node != null && node.nodeType != NodeType.VALUE) delete(path, recursive = true)
       else if (node != null) delete(path)
     }
@@ -527,15 +534,17 @@ class AxsFile(private val filePath: String) {
 
   fun get(path: String): AxsValue? {
     checkOpen()
-    val file = RandomAccessFile(filePath, "r")
-    file.use {
-      it.skipBytes(4); it.readByte()
-      val indexOffset = it.readLong()
-      val index = AxsIndex()
-      index.readFrom(it, indexOffset)
-      val node = index.find(AxsIndex.hashPath(path)) ?: return null
-      return readNode(it, index, node, path)
-    }
+    return runBlocking { fileMutex.withLock {
+      val file = RandomAccessFile(filePath, "r")
+      file.use {
+        it.skipBytes(4); it.readByte()
+        val indexOffset = it.readLong()
+        val index = AxsIndex()
+        index.readFrom(it, indexOffset)
+        val node = index.find(AxsIndex.hashPath(path)) ?: return@withLock null
+        readNode(it, index, node, path)
+      }
+    }}
   }
 
   fun createArray(path: String) { checkOpen(); createNode(path, NodeType.ARRAY) }
@@ -543,16 +552,18 @@ class AxsFile(private val filePath: String) {
 
   fun dump(outputDir: String) {
     checkOpen()
-    val file = RandomAccessFile(filePath, "r")
-    val root = File(outputDir)
-    root.mkdirs()
-    file.use {
-      it.skipBytes(4); it.readByte()
-      val indexOffset = it.readLong()
-      val index = AxsIndex()
-      index.readFrom(it, indexOffset)
-      dumpNode(it, index, AxsIndex.ROOT_ID, root)
-    }
+    runBlocking { fileMutex.withLock {
+      val file = RandomAccessFile(filePath, "r")
+      val root = File(outputDir)
+      root.mkdirs()
+      file.use {
+        it.skipBytes(4); it.readByte()
+        val indexOffset = it.readLong()
+        val index = AxsIndex()
+        index.readFrom(it, indexOffset)
+        dumpNode(it, index, AxsIndex.ROOT_ID, root)
+      }
+    }}
   }
 
   fun import(inputDir: String, force: Boolean = false) {
@@ -565,54 +576,58 @@ class AxsFile(private val filePath: String) {
       if (errors.isNotEmpty()) throw IllegalArgumentException("Import failed:\n${errors.joinToString("\n")}")
     }
 
-    val file = RandomAccessFile(filePath, "rw")
-    file.use {
-      it.skipBytes(4); it.readByte()
-      val indexOffset = it.readLong()
-      val index = AxsIndex()
-      index.readFrom(it, indexOffset)
-      importDir(it, index, dir, "", force)
-    }
+    runBlocking { fileMutex.withLock {
+      val file = RandomAccessFile(filePath, "rw")
+      file.use {
+        it.skipBytes(4); it.readByte()
+        val indexOffset = it.readLong()
+        val index = AxsIndex()
+        index.readFrom(it, indexOffset)
+        importDir(it, index, dir, "", force)
+      }
+    }}
   }
 
   fun delete(path: String, recursive: Boolean = false) {
     checkOpen()
-    val file = RandomAccessFile(filePath, "rw")
-    file.use {
-      it.skipBytes(4); it.readByte()
-      val indexOffset = it.readLong()
-      val index = AxsIndex()
-      index.readFrom(it, indexOffset)
+    runBlocking { fileMutex.withLock {
+      val file = RandomAccessFile(filePath, "rw")
+      file.use {
+        it.skipBytes(4); it.readByte()
+        val indexOffset = it.readLong()
+        val index = AxsIndex()
+        index.readFrom(it, indexOffset)
 
-      val nodeId = AxsIndex.hashPath(path)
-      val node = index.find(nodeId) ?: throw AxsKeyNotFoundException(path)
+        val nodeId = AxsIndex.hashPath(path)
+        val node = index.find(nodeId) ?: throw AxsKeyNotFoundException(path)
 
-      if (node.nodeType != NodeType.VALUE) {
-        val children = index.childrenOf(node.id)
-        if (children.isNotEmpty() && !recursive)
-          throw IllegalStateException("$path is non-empty — use recursive = true")
-      }
-
-      val valuesToDelete = collectValueNodes(index, node).sortedByDescending { it.dataOffset }
-      var totalRemoved = 0L
-
-      for (valueNode in valuesToDelete) {
-        val blockSize = (BLOCK_HEADER_SIZE + valueNode.dataSize).toLong()
-        shiftData(it, valueNode.dataOffset + blockSize, -blockSize)
-        for (other in index.all()) {
-          if (other.nodeType == NodeType.VALUE && other.dataOffset > valueNode.dataOffset)
-            other.dataOffset -= blockSize
+        if (node.nodeType != NodeType.VALUE) {
+          val children = index.childrenOf(node.id)
+          if (children.isNotEmpty() && !recursive)
+            throw IllegalStateException("$path is non-empty — use recursive = true")
         }
-        totalRemoved += blockSize
-      }
 
-      index.remove(node.id)
-      val newIndexOffset = indexOffset - totalRemoved
-      it.seek(newIndexOffset)
-      index.writeTo(it)
-      it.seek(5)
-      it.writeLong(newIndexOffset)
-      it.setLength(newIndexOffset + indexSizeOf(index))
-    }
+        val valuesToDelete = collectValueNodes(index, node).sortedByDescending { it.dataOffset }
+        var totalRemoved = 0L
+
+        for (valueNode in valuesToDelete) {
+          val blockSize = (BLOCK_HEADER_SIZE + valueNode.dataSize).toLong()
+          shiftData(it, valueNode.dataOffset + blockSize, -blockSize)
+          for (other in index.all()) {
+            if (other.nodeType == NodeType.VALUE && other.dataOffset > valueNode.dataOffset)
+              other.dataOffset -= blockSize
+          }
+          totalRemoved += blockSize
+        }
+
+        index.remove(node.id)
+        val newIndexOffset = indexOffset - totalRemoved
+        it.seek(newIndexOffset)
+        index.writeTo(it)
+        it.seek(5)
+        it.writeLong(newIndexOffset)
+        it.setLength(newIndexOffset + indexSizeOf(index))
+      }
+    }}
   }
 }
