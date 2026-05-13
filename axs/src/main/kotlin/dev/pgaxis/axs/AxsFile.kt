@@ -140,7 +140,7 @@ class AxsFile(private val filePath: String) {
     is Char -> axsValueOf(this)
     is Byte -> axsValueOf(this)
     is List<*> -> AxsArray(this.map {
-      (it as? String)?.let { s -> axsValueOf(s) } ?: throw AxsTypeMismatchException("", it?.let { it::class.simpleName } ?: "null", "supported type")
+      it?.toAxsValue() ?: throw AxsTypeMismatchException("", "null", "supported type")
     })
     is Enum<*> -> axsValueOf(this.name)
     else -> {

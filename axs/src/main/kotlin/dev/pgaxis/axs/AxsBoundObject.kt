@@ -27,7 +27,7 @@ class AxsBoundObject<T : Any>(
     val key = prop.name
     writeJobs[key]?.cancel()
     writeJobs[key] = scope.launch {
-      delay(100)
+      delay(300)
       mutex.withLock {
         file.set("$className.$key", value.toAxsCompatibleValue())
       }
@@ -66,20 +66,19 @@ class AxsBoundObject<T : Any>(
     is Char -> axsValueOf(this)
     is Byte -> axsValueOf(this)
     is List<*> -> AxsArray(this.map {
-        (it as? String)?.let { s -> axsValueOf(s) }
-            ?: throw AxsTypeMismatchException(className, it?.let { it::class.simpleName } ?: "null", "supported type")
+      it?.toAxsCompatibleValue() ?: throw AxsTypeMismatchException(className, "null", "supported type")
     })
     is Enum<*> -> axsValueOf(this.name)
     else -> {
-        val props = this::class.memberProperties
-        if (props.isEmpty()) throw AxsTypeMismatchException(className, this::class.simpleName ?: "unknown", "supported type")
-        val children = props.associate { prop ->
-            @Suppress("UNCHECKED_CAST")
-            val value = (prop as KProperty1<Any, *>).get(this)
-            prop.name to (value?.toAxsCompatibleValue()
-                ?: throw AxsTypeMismatchException(className, "null", "supported type"))
-        }
-        AxsObject(children)
+      val props = this::class.memberProperties
+      if (props.isEmpty()) throw AxsTypeMismatchException(className, this::class.simpleName ?: "unknown", "supported type")
+      val children = props.associate { prop ->
+        @Suppress("UNCHECKED_CAST")
+        val value = (prop as KProperty1<Any, *>).get(this)
+        prop.name to (value?.toAxsCompatibleValue()
+          ?: throw AxsTypeMismatchException(className, "null", "supported type"))
+      }
+      AxsObject(children)
     }
   }
 }
