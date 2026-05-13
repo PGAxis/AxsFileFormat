@@ -155,6 +155,40 @@ class AxsFile(private val filePath: String) {
     }
   }
 
+  private fun ensureParentNodes(index: AxsIndex, path: String) {
+    val segments = path.split(".")
+    var currentParentId = AxsIndex.ROOT_ID
+    for (i in 0 until segments.size - 1) {
+      val segment = segments[i]
+      val segPath = segments.subList(0, i + 1).joinToString(".")
+      val segId = AxsIndex.hashPath(segPath)
+      if (index.find(segId) == null) {
+        index.add(AxsNode(
+          id = segId,
+          parentId = currentParentId,
+          nodeType = NodeType.OBJECT,
+          name = segment
+        ))
+      }
+      currentParentId = segId
+    }
+  }
+
+  private fun primitiveToRaw(value: AxsValue): Pair<String, ValueType> = when (value) {
+    is AxsString -> value.value to ValueType.STRING
+    is AxsInt -> value.value.toString() to ValueType.INT
+    is AxsFloat -> value.value.toString() to ValueType.FLOAT
+    is AxsDouble -> value.value.toString() to ValueType.DOUBLE
+    is AxsBool -> value.value.toString() to ValueType.BOOL
+    is AxsLong -> value.value.toString() to ValueType.LONG
+    is AxsShort -> value.value.toString() to ValueType.SHORT
+    is AxsChar -> value.value.toString() to ValueType.CHAR
+    is AxsByte -> value.value.toString() to ValueType.BYTE
+    else -> throw AxsTypeMismatchException(
+      "", value::class.simpleName ?: "unknown", "primitive type"
+    )
+  }
+
   private fun shiftData(file: RandomAccessFile, fromOffset: Long, byBytes: Long, chunkSize: Int = DEFAULT_CHUNK_SIZE) {
     val fileLength = file.length()
     val bytesToMove = fileLength - fromOffset
@@ -227,6 +261,49 @@ class AxsFile(private val filePath: String) {
           .sortedBy { it.name.toIntOrNull() ?: 0 }
           .map { child -> readNode(file, index, child, "$path.${child.name}") }
         AxsArray(items)
+      }
+    }
+  }
+
+  private fun writeNode(file: RandomAccessFile, index: AxsIndex, path: String, name: String, parentId: Long, value: AxsValue) {
+    val nodeId = AxsIndex.hashPath(path)
+    when (value) {
+      is AxsArray -> {
+        index.add(AxsNode(
+          id = nodeId, parentId = parentId,
+          nodeType = NodeType.ARRAY, name = name
+        ))
+        for ((i, child) in value.items.withIndex()) {
+          writeNode(file, index, "$path.$i", i.toString(), nodeId, child)
+        }
+      }
+      is AxsObject -> {
+        index.add(AxsNode(
+          id = nodeId, parentId = parentId,
+          nodeType = NodeType.OBJECT, name = name
+        ))
+        for ((childName, child) in value.children) {
+          writeNode(file, index, "$path.$childName", childName, nodeId, child)
+        }
+      }
+      else -> {
+        val (rawStr, valueType) = primitiveToRaw(value)
+        val dataBytes = rawStr.toByteArray(Charsets.UTF_8)
+        val crc = CRC32().apply { update(dataBytes) }.value.toInt()
+        val dataOffset = file.filePointer
+
+        file.writeInt(dataBytes.size)
+        file.writeByte(valueType.value.toInt())
+        file.writeByte(0)
+        file.writeInt(crc)
+        file.write(dataBytes)
+
+        index.add(AxsNode(
+          id = nodeId, parentId = parentId,
+          nodeType = NodeType.VALUE, name = name,
+          dataOffset = dataOffset, dataSize = dataBytes.size,
+          valueType = valueType
+        ))
       }
     }
   }
@@ -531,6 +608,55 @@ class AxsFile(private val filePath: String) {
   fun set(path: String, value: Short) = set(path, axsValueOf(value))
   fun set(path: String, value: Char) = set(path, axsValueOf(value))
   fun set(path: String, value: Byte) = set(path, axsValueOf(value))
+
+  fun setAll(values: Map<String, AxsValue>) {
+    checkOpen()
+    runBlocking { fileMutex.withLock {
+      val tmpPath = "$filePath.tmp"
+      val tmpFile = RandomAccessFile(tmpPath, "rw")
+      try {
+        tmpFile.write(MAGIC)
+        tmpFile.writeByte(VERSION.toInt())
+        tmpFile.writeLong(0L)
+        tmpFile.write(byteArrayOf(0, 0, 0))
+        tmpFile.writeInt(0)
+
+        tmpFile.seek(HEADER_SIZE)
+
+        val index = AxsIndex()
+
+        for ((path, value) in values) {
+          ensureParentNodes(index, path)
+
+          val segments = path.split(".")
+          val name = segments.last()
+          val parentId = if (segments.size > 1)
+            AxsIndex.hashPath(segments.dropLast(1).joinToString("."))
+          else
+            AxsIndex.ROOT_ID
+
+          writeNode(tmpFile, index, path, name, parentId, value)
+        }
+
+        val indexOffset = tmpFile.filePointer
+        index.writeTo(tmpFile)
+
+        tmpFile.seek(5)
+        tmpFile.writeLong(indexOffset)
+      } catch (e: Exception) {
+        tmpFile.close()
+        File(tmpPath).delete()
+        throw e
+      }
+
+      tmpFile.close()
+
+      if (!File(tmpPath).renameTo(File(filePath))) {
+        File(tmpPath).delete()
+        throw java.io.IOException("setAll: atomic replace failed for $filePath")
+      }
+    }}
+  }
 
   fun get(path: String): AxsValue? {
     checkOpen()

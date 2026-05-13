@@ -37,9 +37,18 @@ class AxsBoundObject<T : Any>(
   fun flush() {
     runBlocking {
       writeJobs.values.forEach { it.cancel() }
-      for (prop in instance::class.memberProperties.filterIsInstance<KMutableProperty1<T, Any>>()) {
-        val value = prop.get(instance) ?: continue
-        file.set("$className.${prop.name}", value.toAxsCompatibleValue())
+      writeJobs.clear()
+
+      val values = buildMap {
+        for (prop in instance::class.memberProperties
+            .filterIsInstance<KMutableProperty1<T, Any>>()) {
+          val value = prop.get(instance) ?: continue
+          put("$className.${prop.name}", value.toAxsCompatibleValue())
+        }
+      }
+
+      mutex.withLock {
+        file.setAll(values)
       }
     }
   }
