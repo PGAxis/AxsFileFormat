@@ -29,6 +29,8 @@ class AxsFile(private val filePath: String) {
       return
     }
 
+    File("$filePath.tmp").delete()
+
     val file = RandomAccessFile(filePath, "r")
     file.use {
       val magic = ByteArray(4)
@@ -126,10 +128,10 @@ class AxsFile(private val filePath: String) {
                     (it as Enum<*>).name == enumValue
                   }
                 } else {
-                  val obj = axsValue as? AxsObject ?: return@let null
-                  val constructor = classifier.primaryConstructor ?: return@let null
+                  val obj = axsValue as? AxsObject ?: continue
+                  val constructor = classifier.primaryConstructor ?: continue
                   val args = constructor.parameters.associateWith { param ->
-                    val child = obj.children[param.name] ?: return@let null
+                    val child = obj.children[param.name] ?: return@associateWith null
                     when (param.type.classifier) {
                       String::class -> (child as? AxsString)?.value
                       Int::class -> (child as? AxsInt)?.value
@@ -522,6 +524,21 @@ class AxsFile(private val filePath: String) {
       it.write(byteArrayOf(0, 0, 0))
       it.writeInt(0)
     }
+  }
+
+  fun debugDumpIndex(): List<String> {
+    return runBlocking { fileMutex.withLock {
+      val file = RandomAccessFile(filePath, "r")
+      file.use {
+        it.skipBytes(4); it.readByte()
+        val indexOffset = it.readLong()
+        val index = AxsIndex()
+        index.readFrom(it, indexOffset)
+        index.all().map { node ->
+          "id=${node.id} parentId=${node.parentId} type=${node.nodeType} name='${node.name}'"
+        }
+      }
+    }}
   }
 
   fun set(path: String, value: String, valueType: ValueType = ValueType.STRING) {
