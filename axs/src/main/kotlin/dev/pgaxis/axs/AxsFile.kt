@@ -85,7 +85,38 @@ class AxsFile(private val filePath: String) {
             Short::class -> (axsValue as? AxsShort)?.value
             Char::class -> (axsValue as? AxsChar)?.value
             Byte::class -> (axsValue as? AxsByte)?.value
-            List::class -> (axsValue as? AxsArray)?.items?.map { (it as AxsString).value }
+            List::class -> {
+              val itemType = prop.returnType.arguments.firstOrNull()?.type?.classifier
+              (axsValue as? AxsArray)?.items?.mapNotNull { item ->
+                when (itemType) {
+                  String::class -> (item as? AxsString)?.value
+                  Int::class -> (item as? AxsInt)?.value
+                  Float::class -> (item as? AxsFloat)?.value
+                  Double::class -> (item as? AxsDouble)?.value
+                  Boolean::class -> (item as? AxsBool)?.value
+                  Long::class -> (item as? AxsLong)?.value
+                  else -> {
+                    if (itemType is KClass<*>) {
+                      val obj = item as? AxsObject ?: return@mapNotNull null
+                      val constructor = itemType.primaryConstructor ?: return@mapNotNull null
+                      val args = constructor.parameters.associateWith { param ->
+                        val child = obj.children[param.name] ?: return@mapNotNull null
+                        when (param.type.classifier) {
+                          String::class -> (child as? AxsString)?.value
+                          Int::class -> (child as? AxsInt)?.value
+                          Float::class -> (child as? AxsFloat)?.value
+                          Double::class -> (child as? AxsDouble)?.value
+                          Boolean::class -> (child as? AxsBool)?.value
+                          Long::class -> (child as? AxsLong)?.value
+                          else -> null
+                        }
+                      }
+                      constructor.callBy(args)
+                    } else null
+                  }
+                }
+              }
+            }
             else -> {
               val classifier = prop.returnType.classifier
               if (classifier is KClass<*>) {
