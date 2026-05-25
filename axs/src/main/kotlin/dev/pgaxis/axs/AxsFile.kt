@@ -534,9 +534,49 @@ class AxsFile(private val filePath: String) {
         val indexOffset = it.readLong()
         val index = AxsIndex()
         index.readFrom(it, indexOffset)
-        index.all().map { node ->
-          "id=${node.id} parentId=${node.parentId} type=${node.nodeType} name='${node.name}'"
+
+        val result = mutableListOf<String>()
+        val printed = mutableSetOf<Long>()
+
+        fun readValue(node: AxsNode): String {
+          if (node.dataOffset < 0) return ""
+          return try {
+            it.seek(node.dataOffset + 10)
+            val dataBytes = ByteArray(node.dataSize)
+            it.readFully(dataBytes)
+            String(dataBytes, Charsets.UTF_8)
+          } catch (e: Exception) {
+            "<error: ${e.message}>"
+          }
         }
+
+        fun printTree(nodeId: Long, depth: Int) {
+          val children = index.childrenOf(nodeId)
+          for (node in children) {
+            if (node.id in printed) continue
+            printed.add(node.id)
+            val indent = "  ".repeat(depth)
+            val value = if (node.nodeType == NodeType.VALUE) " value='${readValue(node)}'" else ""
+            result.add("${indent}id=${node.id} parentId=${node.parentId} type=${node.nodeType} name='${node.name}'$value")
+            printTree(node.id, depth + 1)
+          }
+        }
+
+        result.add("=== Tree ===")
+        printTree(AxsIndex.ROOT_ID, 0)
+
+        // Print any orphaned nodes not reached by the tree
+        val orphans = index.all().filter { it.id !in printed && it.id != AxsIndex.ROOT_ID }
+        if (orphans.isNotEmpty()) {
+          result.add("=== Orphans ===")
+          for (node in orphans) {
+            val value = if (node.nodeType == NodeType.VALUE) " value='${readValue(node)}'" else ""
+            result.add("id=${node.id} parentId=${node.parentId} type=${node.nodeType} name='${node.name}'$value")
+            printTree(node.id, 1)
+          }
+        }
+
+        result
       }
     }}
   }
