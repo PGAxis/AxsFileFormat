@@ -29,7 +29,7 @@ class AxsBoundObject<T : Any>(
     writeJobs[key] = scope.launch {
       delay(300)
       mutex.withLock {
-        file.set("$className.$key", value.toAxsCompatibleValue())
+        flush()
       }
     }
   }
