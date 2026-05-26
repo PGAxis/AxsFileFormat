@@ -29,7 +29,12 @@ class AxsBoundObject<T : Any>(
     writeJobs[key] = scope.launch {
       delay(300)
       mutex.withLock {
-        flush()
+        val isPrimitive = value is String || value is Int || value is Long ||
+          value is Float || value is Double || value is Boolean ||
+          value is Short || value is Char || value is Byte || value is Enum<*>
+
+        if (isPrimitive) file.set("$className.$key", value.toAxsCompatibleValue())
+        else flush()
       }
     }
   }
