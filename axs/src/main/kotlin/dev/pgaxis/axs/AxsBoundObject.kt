@@ -10,12 +10,9 @@ import kotlinx.coroutines.sync.withLock
 class AxsBoundObject<T : Any>(
   private val file: AxsFile,
   private var instance: T,
-  private val className: String
+  private val className: String,
+  private val writeQueue: WriteQueue
 ) {
-  private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-  private val mutex = Mutex()
-  private val writeJobs = mutableMapOf<String, Job>()
-
   fun <V> getValue(prop: KProperty1<T, V>): V {
     return prop.get(instance)
   }
@@ -24,37 +21,21 @@ class AxsBoundObject<T : Any>(
     if (!file.isOpen()) throw AxsFileNotOpenException(className)
     prop.set(instance, value)
 
-    val key = prop.name
-    writeJobs[key]?.cancel()
-    writeJobs[key] = scope.launch {
-      delay(300)
-      mutex.withLock {
-        val isPrimitive = value is String || value is Int || value is Long ||
-          value is Float || value is Double || value is Boolean ||
-          value is Short || value is Char || value is Byte || value is Enum<*>
-
-        if (isPrimitive) file.set("$className.$key", value.toAxsCompatibleValue())
-        else flush()
-      }
+    writeQueue.enqueue(prop.name) {
+      file.set("$className.${prop.name}", value.toAxsCompatibleValue())
     }
   }
 
   fun flush() {
+    writeQueue.cancel()
     runBlocking {
-      writeJobs.values.forEach { it.cancel() }
-      writeJobs.clear()
-
       val values = buildMap {
-        for (prop in instance::class.memberProperties
-            .filterIsInstance<KMutableProperty1<T, Any>>()) {
+        for (prop in instance::class.memberProperties.filterIsInstance<KMutableProperty1<T, Any>>()) {
           val value = prop.get(instance) ?: continue
           put("$className.${prop.name}", value.toAxsCompatibleValue())
         }
       }
-
-      mutex.withLock {
-        file.setAll(values)
-      }
+      file.setAll(values)
     }
   }
 

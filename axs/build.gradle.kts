@@ -25,7 +25,7 @@ publishing {
 
       groupId = "dev.pgaxis"
       artifactId = "axs"
-      version = "1.0.13"
+      version = "1.0.14"
 
       pom {
         name = "AXS — Axis Xtensible Settings"

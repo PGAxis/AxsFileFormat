@@ -3,6 +3,7 @@ package dev.pgaxis.axs
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.zip.CRC32
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.reflect.KProperty1
 import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.full.memberProperties
@@ -20,6 +21,16 @@ class AxsFile(private val filePath: String) {
   private val DEFAULT_CHUNK_SIZE = 4096
   private val fileMutex = Mutex()
 
+  companion object {
+    private val queues = ConcurrentHashMap<String, WriteQueue>()
+
+    private fun queueFor(filePath: String): WriteQueue {
+      val canonical = File(filePath).canonicalPath
+      return queues.getOrPut(canonical) { WriteQueue() }
+    }
+  }
+
+  private val writeQueue = queueFor(filePath)
   private var isFileOpen: Boolean = false
 
   fun open() {
@@ -158,7 +169,7 @@ class AxsFile(private val filePath: String) {
       }
     }
 
-    return AxsBoundObject(this, instance, className)
+    return AxsBoundObject(this, instance, className, writeQueue)
   }
 
   // ---------- Private helpers ----------
