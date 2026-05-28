@@ -50,7 +50,21 @@ class WriteQueue {
   }
 
   fun cancel() {
-    processorJob?.cancel()
     synchronized(lock) { queue.clear() }
+    runBlocking { processorJob?.cancelAndJoin() }
+  }
+
+  fun flushNow() {
+    runBlocking {
+      processorJob?.cancelAndJoin()
+      val remaining = synchronized(lock) {
+        val copy = queue.toList()
+        queue.clear()
+        copy
+      }
+      for (entry in remaining) {
+        entry.write()
+      }
+    }
   }
 }

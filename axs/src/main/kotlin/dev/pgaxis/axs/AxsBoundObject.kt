@@ -27,16 +27,7 @@ class AxsBoundObject<T : Any>(
   }
 
   fun flush() {
-    writeQueue.cancel()
-    runBlocking {
-      val values = buildMap {
-        for (prop in instance::class.memberProperties.filterIsInstance<KMutableProperty1<T, Any>>()) {
-          val value = prop.get(instance) ?: continue
-          put("$className.${prop.name}", value.toAxsCompatibleValue())
-        }
-      }
-      file.setAll(values)
-    }
+    writeQueue.flushNow()
   }
 
   fun get(): T = instance
