@@ -611,7 +611,9 @@ class AxsFile(private val filePath: String) {
   }
 
   fun set(path: String, value: String, valueType: ValueType = ValueType.STRING) {
+    if (LOGGING) println("[set] setting $path, value=$value")
     checkOpen()
+    if (LOGGING) println("[set] file is open")
     runBlocking { fileMutex.withLock {
       val tmpPath = "$filePath.tmp"
       File(filePath).copyTo(File(tmpPath), overwrite = true)
@@ -697,6 +699,11 @@ class AxsFile(private val filePath: String) {
             it.writeLong(newIndexOffset)
           }
         }
+        if (!File(tmpPath).renameTo(File(filePath))) {
+          File(tmpPath).delete()
+          throw java.io.IOException("set: atomic replace failed for $filePath")
+        }
+        if (LOGGING) println("[set] successfully rewritten original file")
       } catch (e: Exception) {
         File(tmpPath).delete()
         throw e
