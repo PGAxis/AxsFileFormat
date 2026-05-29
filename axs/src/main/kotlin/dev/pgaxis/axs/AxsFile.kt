@@ -20,6 +20,7 @@ class AxsFile(private val filePath: String) {
   private val BLOCK_HEADER_SIZE = 10
   private val DEFAULT_CHUNK_SIZE = 4096
   private val fileMutex = Mutex()
+  private var LOGGING = false
 
   companion object {
     private val queues = ConcurrentHashMap<String, WriteQueue>()
@@ -65,6 +66,10 @@ class AxsFile(private val filePath: String) {
 
   fun isOpen(): Boolean = isFileOpen
 
+  fun setLogging(on: Boolean) {
+    LOGGING = on
+  }
+
   private fun checkOpen() {
     if (!isFileOpen) throw AxsFileNotOpenException(filePath)
   }
@@ -75,28 +80,28 @@ class AxsFile(private val filePath: String) {
     val className = instance::class.simpleName
       ?: throw IllegalArgumentException("Cannot bind anonymous class")
 
-    println("[AxsBind] Binding $className")
+    if (LOGGING) println("[AxsBind] Binding $className")
     val existing = get(className)
-    println("[AxsBind] get($className) returned: $existing")
+    if (LOGGING) println("[AxsBind] get($className) returned: $existing")
 
     if (existing == null) {
-      println("[AxsBind] No existing data, writing defaults")
+      if (LOGGING) println("[AxsBind] No existing data, writing defaults")
       createObject(className)
       for (prop in instance::class.memberProperties) {
         @Suppress("UNCHECKED_CAST")
         val value = (prop as KProperty1<T, *>).get(instance)
-        println("[AxsBind] Writing default ${prop.name} = $value")
+        if (LOGGING) println("[AxsBind] Writing default ${prop.name} = $value")
         if (value != null) set("$className.${prop.name}", value.toAxsValue())
       }
     } else {
-      println("[AxsBind] Found existing data, restoring properties")
+      if (LOGGING) println("[AxsBind] Found existing data, restoring properties")
       val saved = existing as? AxsObject
       saved?.let {
         for (prop in instance::class.memberProperties.filterIsInstance<KMutableProperty1<T, *>>()) {
-          println("[AxsBind] Restoring ${prop.name} (type: ${prop.returnType})")
+          if (LOGGING) println("[AxsBind] Restoring ${prop.name} (type: ${prop.returnType})")
           val key = prop.name
           val axsValue = it.children[key] ?: continue
-          println("[AxsBind] raw value: $axsValue")
+          if (LOGGING) println("[AxsBind] raw value: $axsValue")
           val converted: Any? = when (prop.returnType.classifier) {
             String::class -> (axsValue as? AxsString)?.value
             Int::class -> (axsValue as? AxsInt)?.value
@@ -513,6 +518,7 @@ class AxsFile(private val filePath: String) {
   }
 
   private fun setAxsValue(path: String, value: AxsValue) {
+    if (LOGGING) println("[setAxsValue] setting $path, value=$value")
     when (value) {
       is AxsString -> set(path, value.value, ValueType.STRING)
       is AxsInt -> set(path, value.value.toString(), ValueType.INT)
@@ -529,7 +535,10 @@ class AxsFile(private val filePath: String) {
       }
       is AxsArray -> {
         createArray(path)
-        for ((index, child) in value.items.withIndex()) setAxsValue("$path.$index", child)
+        for ((index, child) in value.items.withIndex()) {
+          if (LOGGING) println("[setAxsValue] setting $path.$index, value=$child")
+          setAxsValue("$path.$index", child)
+        }
       }
     }
   }
