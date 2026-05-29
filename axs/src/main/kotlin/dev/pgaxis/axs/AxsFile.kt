@@ -75,19 +75,28 @@ class AxsFile(private val filePath: String) {
     val className = instance::class.simpleName
       ?: throw IllegalArgumentException("Cannot bind anonymous class")
 
-    if (get(className) == null) {
+    println("[AxsBind] Binding $className")
+    val existing = get(className)
+    println("[AxsBind] get($className) returned: $existing")
+
+    if (existing == null) {
+      println("[AxsBind] No existing data, writing defaults")
       createObject(className)
       for (prop in instance::class.memberProperties) {
         @Suppress("UNCHECKED_CAST")
         val value = (prop as KProperty1<T, *>).get(instance)
+        println("[AxsBind] Writing default ${prop.name} = $value")
         if (value != null) set("$className.${prop.name}", value.toAxsValue())
       }
     } else {
-      val saved = get(className) as? AxsObject
+      println("[AxsBind] Found existing data, restoring properties")
+      val saved = existing as? AxsObject
       saved?.let {
         for (prop in instance::class.memberProperties.filterIsInstance<KMutableProperty1<T, *>>()) {
+          println("[AxsBind] Restoring ${prop.name} (type: ${prop.returnType})")
           val key = prop.name
           val axsValue = it.children[key] ?: continue
+          println("[AxsBind] raw value: $axsValue")
           val converted: Any? = when (prop.returnType.classifier) {
             String::class -> (axsValue as? AxsString)?.value
             Int::class -> (axsValue as? AxsInt)?.value
@@ -595,86 +604,93 @@ class AxsFile(private val filePath: String) {
   fun set(path: String, value: String, valueType: ValueType = ValueType.STRING) {
     checkOpen()
     runBlocking { fileMutex.withLock {
-      val file = RandomAccessFile(filePath, "rw")
-      file.use {
-        val magic = ByteArray(4)
-        it.readFully(magic)
-        it.readByte()
-        val indexOffset = it.readLong()
-        val index = AxsIndex()
-        index.readFrom(it, indexOffset)
+      val tmpPath = "$filePath.tmp"
+      File(filePath).copyTo(File(tmpPath), overwrite = true)
+      try {
+        val file = RandomAccessFile(tmpPath, "rw")
+        file.use {
+          val magic = ByteArray(4)
+          it.readFully(magic)
+          it.readByte()
+          val indexOffset = it.readLong()
+          val index = AxsIndex()
+          index.readFrom(it, indexOffset)
 
-        val segments = path.split(".")
-        var currentParentId = AxsIndex.ROOT_ID
-        for (i in 0 until segments.size - 1) {
-          val segment = segments[i]
-          val segmentPath = segments.subList(0, i + 1).joinToString(".")
-          val segmentId = AxsIndex.hashPath(segmentPath)
-          if (index.find(segmentId) == null) {
-            index.add(AxsNode(id = segmentId, parentId = currentParentId, nodeType = NodeType.OBJECT, name = segment))
-          }
-          currentParentId = segmentId
-        }
-
-        val dataBytes = value.toByteArray(Charsets.UTF_8)
-        val crc = CRC32().apply { update(dataBytes) }.value.toInt()
-        val finalSegment = segments.last()
-        val nodeId = AxsIndex.hashPath(path)
-        val existingNode = index.find(nodeId)
-
-        if (existingNode == null) {
-          it.seek(indexOffset)
-          it.writeInt(dataBytes.size)
-          it.writeByte(valueType.value.toInt())
-          it.writeByte(0)
-          it.writeInt(crc)
-          it.write(dataBytes)
-
-          index.add(AxsNode(id = nodeId, parentId = currentParentId, nodeType = NodeType.VALUE,
-            name = finalSegment, dataOffset = indexOffset, dataSize = dataBytes.size, valueType = valueType))
-
-          val newIndexOffset = indexOffset + BLOCK_HEADER_SIZE + dataBytes.size
-          it.seek(newIndexOffset)
-          index.writeTo(it)
-          it.seek(5)
-          it.writeLong(newIndexOffset)
-
-        } else if (dataBytes.size == existingNode.dataSize) {
-          it.seek(existingNode.dataOffset + 6)
-          it.writeInt(crc)
-          it.write(dataBytes)
-          it.seek(existingNode.dataOffset + 4)
-          it.writeByte(valueType.value.toInt())
-          existingNode.valueType = valueType
-
-        } else {
-          val oldBlockSize = BLOCK_HEADER_SIZE + existingNode.dataSize
-          val newBlockSize = BLOCK_HEADER_SIZE + dataBytes.size
-          val diff = (newBlockSize - oldBlockSize).toLong()
-
-          shiftData(it, existingNode.dataOffset + oldBlockSize, diff)
-
-          it.seek(existingNode.dataOffset)
-          it.writeInt(dataBytes.size)
-          it.writeByte(valueType.value.toInt())
-          it.writeByte(0)
-          it.writeInt(crc)
-          it.write(dataBytes)
-
-          for (node in index.all()) {
-            if (node.nodeType == NodeType.VALUE && node.dataOffset > existingNode.dataOffset)
-              node.dataOffset += diff
+          val segments = path.split(".")
+          var currentParentId = AxsIndex.ROOT_ID
+          for (i in 0 until segments.size - 1) {
+            val segment = segments[i]
+            val segmentPath = segments.subList(0, i + 1).joinToString(".")
+            val segmentId = AxsIndex.hashPath(segmentPath)
+            if (index.find(segmentId) == null) {
+              index.add(AxsNode(id = segmentId, parentId = currentParentId, nodeType = NodeType.OBJECT, name = segment))
+            }
+            currentParentId = segmentId
           }
 
-          existingNode.dataSize = dataBytes.size
-          existingNode.valueType = valueType
+          val dataBytes = value.toByteArray(Charsets.UTF_8)
+          val crc = CRC32().apply { update(dataBytes) }.value.toInt()
+          val finalSegment = segments.last()
+          val nodeId = AxsIndex.hashPath(path)
+          val existingNode = index.find(nodeId)
 
-          val newIndexOffset = indexOffset + diff
-          it.seek(newIndexOffset)
-          index.writeTo(it)
-          it.seek(5)
-          it.writeLong(newIndexOffset)
+          if (existingNode == null) {
+            it.seek(indexOffset)
+            it.writeInt(dataBytes.size)
+            it.writeByte(valueType.value.toInt())
+            it.writeByte(0)
+            it.writeInt(crc)
+            it.write(dataBytes)
+
+            index.add(AxsNode(id = nodeId, parentId = currentParentId, nodeType = NodeType.VALUE,
+              name = finalSegment, dataOffset = indexOffset, dataSize = dataBytes.size, valueType = valueType))
+
+            val newIndexOffset = indexOffset + BLOCK_HEADER_SIZE + dataBytes.size
+            it.seek(newIndexOffset)
+            index.writeTo(it)
+            it.seek(5)
+            it.writeLong(newIndexOffset)
+
+          } else if (dataBytes.size == existingNode.dataSize) {
+            it.seek(existingNode.dataOffset + 6)
+            it.writeInt(crc)
+            it.write(dataBytes)
+            it.seek(existingNode.dataOffset + 4)
+            it.writeByte(valueType.value.toInt())
+            existingNode.valueType = valueType
+
+          } else {
+            val oldBlockSize = BLOCK_HEADER_SIZE + existingNode.dataSize
+            val newBlockSize = BLOCK_HEADER_SIZE + dataBytes.size
+            val diff = (newBlockSize - oldBlockSize).toLong()
+
+            shiftData(it, existingNode.dataOffset + oldBlockSize, diff)
+
+            it.seek(existingNode.dataOffset)
+            it.writeInt(dataBytes.size)
+            it.writeByte(valueType.value.toInt())
+            it.writeByte(0)
+            it.writeInt(crc)
+            it.write(dataBytes)
+
+            for (node in index.all()) {
+              if (node.nodeType == NodeType.VALUE && node.dataOffset > existingNode.dataOffset)
+                node.dataOffset += diff
+            }
+
+            existingNode.dataSize = dataBytes.size
+            existingNode.valueType = valueType
+
+            val newIndexOffset = indexOffset + diff
+            it.seek(newIndexOffset)
+            index.writeTo(it)
+            it.seek(5)
+            it.writeLong(newIndexOffset)
+          }
         }
+      } catch (e: Exception) {
+        File(tmpPath).delete()
+        throw e
       }
     }}
   }
