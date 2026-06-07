@@ -517,32 +517,6 @@ class AxsFile(private val filePath: String) {
     return size
   }
 
-  private fun setAxsValue(path: String, value: AxsValue) {
-    if (LOGGING) println("[setAxsValue] setting $path, value=$value")
-    when (value) {
-      is AxsString -> set(path, value.value, ValueType.STRING)
-      is AxsInt -> set(path, value.value.toString(), ValueType.INT)
-      is AxsFloat -> set(path, value.value.toString(), ValueType.FLOAT)
-      is AxsBool -> set(path, value.value.toString(), ValueType.BOOL)
-      is AxsDouble -> set(path, value.value.toString(), ValueType.DOUBLE)
-      is AxsLong -> set(path, value.value.toString(), ValueType.LONG)
-      is AxsShort -> set(path, value.value.toString(), ValueType.SHORT)
-      is AxsChar -> set(path, value.value.toString(), ValueType.CHAR)
-      is AxsByte -> set(path, value.value.toString(), ValueType.BYTE)
-      is AxsObject -> {
-        createObject(path)
-        for ((key, child) in value.children) setAxsValue("$path.$key", child)
-      }
-      is AxsArray -> {
-        createArray(path)
-        for ((index, child) in value.items.withIndex()) {
-          if (LOGGING) println("[setAxsValue] setting $path.$index, value=$child")
-          setAxsValue("$path.$index", child)
-        }
-      }
-    }
-  }
-
   // ---------- Public API ----------
   private fun create() {
     val file = RandomAccessFile(filePath, "rw")
@@ -727,7 +701,11 @@ class AxsFile(private val filePath: String) {
       if (node != null && node.nodeType != NodeType.VALUE) delete(path, recursive = true)
       else if (node != null) delete(path)
     }
-    setAxsValue(path, value)
+
+    when (value) {
+      is AxsArray, is AxsObject -> setBulk(path, value)
+      else -> setAxsValue(path, value)
+    }
   }
 
   fun set(path: String, value: String) = set(path, axsValueOf(value))
@@ -739,6 +717,189 @@ class AxsFile(private val filePath: String) {
   fun set(path: String, value: Short) = set(path, axsValueOf(value))
   fun set(path: String, value: Char) = set(path, axsValueOf(value))
   fun set(path: String, value: Byte) = set(path, axsValueOf(value))
+
+  private fun setAxsValue(path: String, value: AxsValue) {
+    if (LOGGING) println("[setAxsValue] setting $path, value=$value")
+    when (value) {
+      is AxsString -> set(path, value.value, ValueType.STRING)
+      is AxsInt -> set(path, value.value.toString(), ValueType.INT)
+      is AxsFloat -> set(path, value.value.toString(), ValueType.FLOAT)
+      is AxsBool -> set(path, value.value.toString(), ValueType.BOOL)
+      is AxsDouble -> set(path, value.value.toString(), ValueType.DOUBLE)
+      is AxsLong -> set(path, value.value.toString(), ValueType.LONG)
+      is AxsShort -> set(path, value.value.toString(), ValueType.SHORT)
+      is AxsChar -> set(path, value.value.toString(), ValueType.CHAR)
+      is AxsByte -> set(path, value.value.toString(), ValueType.BYTE)
+      is AxsObject -> {
+        createObject(path)
+        for ((key, child) in value.children) setAxsValue("$path.$key", child)
+      }
+      is AxsArray -> {
+        createArray(path)
+        for ((index, child) in value.items.withIndex()) {
+          if (LOGGING) println("[setAxsValue] setting $path.$index, value=$child")
+          setAxsValue("$path.$index", child)
+        }
+      }
+    }
+  }
+
+  private fun setBulk(path: String, root: AxsValue) {
+    val entries = mutableListOf<Pair<String, AxsValue>>()
+    collectEntries(path, root, entries)
+
+    runBlocking { fileMutex.withLock {
+      val tmpPath = "$filePath.tmp"
+      File(filePath).copyTo(File(tmpPath), overwrite = true)
+      try {
+        val file = RandomAccessFile(tmpPath, "rw")
+        file.use { raf ->
+          val magic = ByteArray(4)
+          raf.readFully(magic)
+          raf.readByte()
+          var indexOffset = raf.readLong()
+          val index = AxsIndex()
+          index.readFrom(raf, indexOffset)
+
+          for ((entryPath, value) in entries) {
+            indexOffset = writeEntry(raf, index, indexOffset, entryPath, value)
+          }
+
+          raf.seek(indexOffset)
+          index.writeTo(raf)
+          raf.seek(5)
+          raf.writeLong(indexOffset)
+        }
+
+        if (!File(tmpPath).renameTo(File(filePath))) {
+          File(tmpPath).delete()
+          throw java.io.IOException("setBulk: atomic replace failed for $filePath")
+        }
+      } catch (e: Exception) {
+        File(tmpPath).delete()
+        throw e
+      }
+    }}
+  }
+
+  // Recursively walks the value tree, emitting (path, leaf) pairs in insertion order.
+  // Objects and arrays emit a structural marker first (so createObject/createArray
+  // node entries land in the index before their children).
+  private fun collectEntries(path: String, value: AxsValue, out: MutableList<Pair<String, AxsValue>>) {
+    when (value) {
+      is AxsObject -> {
+        out.add(path to value)
+        for ((key, child) in value.children)
+          collectEntries("$path.$key", child, out)
+      }
+      is AxsArray -> {
+        out.add(path to value)
+        for ((i, child) in value.items.withIndex())
+          collectEntries("$path.$i", child, out)
+      }
+      else -> out.add(path to value)
+    }
+  }
+
+  // Writes a single entry into an already-open RAF + in-memory index.
+  // For structural markers (AxsObject/AxsArray) it only adds the index node, no data block.
+  // Returns the (possibly updated) indexOffset.
+  private fun writeEntry(
+    raf: RandomAccessFile,
+    index: AxsIndex,
+    indexOffset: Long,
+    path: String,
+    value: AxsValue
+  ): Long {
+    val segments = path.split(".")
+    var currentParentId = AxsIndex.ROOT_ID
+    for (i in 0 until segments.size - 1) {
+      val segPath = segments.subList(0, i + 1).joinToString(".")
+      val segId = AxsIndex.hashPath(segPath)
+      if (index.find(segId) == null)
+        index.add(AxsNode(id = segId, parentId = currentParentId,
+          nodeType = NodeType.OBJECT, name = segments[i]))
+      currentParentId = segId
+    }
+
+    val nodeId = AxsIndex.hashPath(path)
+    val parentId = if (segments.size > 1)
+      AxsIndex.hashPath(segments.dropLast(1).joinToString("."))
+    else
+      AxsIndex.ROOT_ID
+
+    if (value is AxsObject) {
+      if (index.find(nodeId) == null)
+        index.add(AxsNode(id = nodeId, parentId = parentId,
+          nodeType = NodeType.OBJECT, name = segments.last()))
+      return indexOffset
+    }
+    if (value is AxsArray) {
+      if (index.find(nodeId) == null)
+        index.add(AxsNode(id = nodeId, parentId = parentId,
+          nodeType = NodeType.ARRAY, name = segments.last()))
+      return indexOffset
+    }
+
+    val (rawValue, valueType) = when (value) {
+      is AxsString -> value.value to ValueType.STRING
+      is AxsInt -> value.value.toString() to ValueType.INT
+      is AxsFloat -> value.value.toString() to ValueType.FLOAT
+      is AxsDouble -> value.value.toString() to ValueType.DOUBLE
+      is AxsBool -> value.value.toString() to ValueType.BOOL
+      is AxsLong -> value.value.toString() to ValueType.LONG
+      is AxsShort -> value.value.toString() to ValueType.SHORT
+      is AxsChar -> value.value.toString() to ValueType.CHAR
+      is AxsByte -> value.value.toString() to ValueType.BYTE
+      else -> return indexOffset // unreachable
+    }
+
+    val dataBytes = rawValue.toByteArray(Charsets.UTF_8)
+    val crc = CRC32().apply { update(dataBytes) }.value.toInt()
+    val existingNode = index.find(nodeId)
+
+    return when {
+      existingNode == null -> {
+        raf.seek(indexOffset)
+        raf.writeInt(dataBytes.size)
+        raf.writeByte(valueType.value.toInt())
+        raf.writeByte(0)
+        raf.writeInt(crc)
+        raf.write(dataBytes)
+        index.add(AxsNode(id = nodeId, parentId = parentId, nodeType = NodeType.VALUE,
+          name = segments.last(), dataOffset = indexOffset,
+          dataSize = dataBytes.size, valueType = valueType))
+        indexOffset + BLOCK_HEADER_SIZE + dataBytes.size
+      }
+      dataBytes.size == existingNode.dataSize -> {
+        raf.seek(existingNode.dataOffset + 6)
+        raf.writeInt(crc)
+        raf.write(dataBytes)
+        raf.seek(existingNode.dataOffset + 4)
+        raf.writeByte(valueType.value.toInt())
+        existingNode.valueType = valueType
+        indexOffset
+      }
+      else -> {
+        val oldBlockSize = BLOCK_HEADER_SIZE + existingNode.dataSize
+        val newBlockSize = BLOCK_HEADER_SIZE + dataBytes.size
+        val diff = (newBlockSize - oldBlockSize).toLong()
+        shiftData(raf, existingNode.dataOffset + oldBlockSize, diff)
+        raf.seek(existingNode.dataOffset)
+        raf.writeInt(dataBytes.size)
+        raf.writeByte(valueType.value.toInt())
+        raf.writeByte(0)
+        raf.writeInt(crc)
+        raf.write(dataBytes)
+        for (node in index.all())
+          if (node.nodeType == NodeType.VALUE && node.dataOffset > existingNode.dataOffset)
+            node.dataOffset += diff
+        existingNode.dataSize = dataBytes.size
+        existingNode.valueType = valueType
+        indexOffset + diff
+      }
+    }
+  }
 
   fun setAll(values: Map<String, AxsValue>) {
     checkOpen()
