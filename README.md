@@ -7,9 +7,9 @@ It supports nested objects, arrays, and all common primitive types, making it su
 # Why
 As mentioned before, AXS was created due to lack of well-fitting file formats to store settings. That should be taken with a grain of salt, as I did about two Google searches before coming to that conclusion. Anyway, that is why I created the AXS file format - to finally have a way of storing settings in a meaningful way, without having to compromise on disk space (as one alternative would be to just store one setting per file).
 
-</div>
-
 # How to use
+
+</div>
 
 <div align="center"><h3>Importing the library</h3></div>
 
