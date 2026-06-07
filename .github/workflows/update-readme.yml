@@ -1,9 +1,10 @@
 name: Update README version
 
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
+  push:
+    branches:
+      - main
+  workflow_dispatch: 
 
 jobs:
   update-readme:
@@ -15,8 +16,10 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Strip 'v' from tag
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+      - name: Extract version from build.gradle.kts
+        run: |
+          VERSION=$(grep -m1 'version = ' axs/build.gradle.kts | sed 's/.*version = "\(.*\)".*/\1/')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Replace version in README
         run: sed -i "s/[0-9]\+\.[0-9]\+\.[0-9]\+/${{ env.VERSION }}/g" README.md
@@ -26,5 +29,5 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add README.md
-          git commit -m "docs: bump version to ${{ env.VERSION }}" || echo "No changes"
+          git diff --cached --quiet || git commit -m "docs: bump version to ${{ env.VERSION }}"
           git push
