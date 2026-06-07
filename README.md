@@ -16,14 +16,14 @@ As mentioned before, AXS was created due to lack of well-fitting file formats to
 Add the following to your `build.gradle.kts`:
 
 ```kotlin
-implementation("dev.pgaxis:axs:1.0.0")
+implementation("dev.pgaxis:axs:main")
 ```
 
 or, when using `libs.version.toml`:
 
 ```toml
 [versions]
-axs = "1.0.0"
+axs = "main"
 [libraries]
 axs = { group = "dev.pgaxis", name = "axs", version.ref = "axs" }
 ```
