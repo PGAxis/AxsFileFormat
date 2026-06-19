@@ -3,64 +3,64 @@ package dev.pgaxis.axs
 import java.io.RandomAccessFile
 
 enum class NodeType(val value: Byte) {
-  OBJECT(0), ARRAY(1), VALUE(2);
-  companion object { fun from(b: Byte) = entries.first { it.value == b } }
+    OBJECT(0), ARRAY(1), VALUE(2);
+    companion object { fun from(b: Byte) = entries.first { it.value == b } }
 }
 
 enum class ValueType(val value: Byte) {
-  STRING(0), INT(1), FLOAT(2), BOOL(3), DOUBLE(4), LONG(5), SHORT(6), CHAR(7), BYTE(8);
-  companion object { fun from(b: Byte) = entries.first { it.value == b } }
+    STRING(0), INT(1), FLOAT(2), BOOL(3), DOUBLE(4), LONG(5), SHORT(6), CHAR(7), BYTE(8), NULL(9);
+    companion object { fun from(b: Byte) = entries.first { it.value == b } }
 }
 
 data class AxsNode(
-  val id: Long,
-  val parentId: Long,
-  val nodeType: NodeType,
-  val name: String,
+    val id: Long,
+    val parentId: Long,
+    val nodeType: NodeType,
+    val name: String,
 
-  var dataOffset: Long = -1,
-  var dataSize: Int = -1,
-  var valueType: ValueType = ValueType.STRING
+    var dataOffset: Long = -1,
+    var dataSize: Int = -1,
+    var valueType: ValueType = ValueType.STRING
 )
 
-class AxsIndex{
-  private val nodes = mutableListOf<AxsNode>()
+class AxsIndex {
+    private val nodes = mutableListOf<AxsNode>()
 
-  companion object {
-    const val ROOT_ID = 0L
-    const val NO_PARENT = -1L
+    companion object {
+        const val ROOT_ID = 0L
+        const val NO_PARENT = -1L
 
-    fun hashPath(path: String): Long {
-      var hash = -3750763034362895579L
-      for (byte in path.toByteArray(Charsets.UTF_8)) {
-        hash = (hash xor byte.toLong()) * 1099511628211L
-      }
-      return hash
+        fun hashPath(path: String): Long {
+            var hash = -3750763034362895579L
+            for (byte in path.toByteArray(Charsets.UTF_8)) {
+                hash = (hash xor byte.toLong()) * 1099511628211L
+            }
+            return hash
+        }
     }
-  }
 
-  init {
-    nodes.add(AxsNode(ROOT_ID, NO_PARENT, NodeType.OBJECT, "root"))
-  }
+    init {
+        nodes.add(AxsNode(ROOT_ID, NO_PARENT, NodeType.OBJECT, "root"))
+    }
 
-  fun find(id: Long): AxsNode? = nodes.find { it.id == id }
+    fun find(id: Long): AxsNode? = nodes.find { it.id == id }
 
-  fun findByPath(path: String): AxsNode? = find(hashPath(path))
+    fun findByPath(path: String): AxsNode? = find(hashPath(path))
 
-  fun childrenOf(parentId: Long): List<AxsNode> = nodes.filter { it.parentId == parentId }
+    fun childrenOf(parentId: Long): List<AxsNode> = nodes.filter { it.parentId == parentId }
 
-  fun add(node: AxsNode) {
-    nodes.add(node)
-  }
+    fun add(node: AxsNode) {
+        nodes.add(node)
+    }
 
-  fun remove(id: Long): Boolean {
-    childrenOf(id).forEach { remove(it.id) }
-    return nodes.removeIf { it.id == id }
-  }
+    fun remove(id: Long): Boolean {
+        childrenOf(id).forEach { remove(it.id) }
+        return nodes.removeIf { it.id == id }
+    }
 
-  fun all(): List<AxsNode> = nodes.toList()
+    fun all(): List<AxsNode> = nodes.toList()
 
-  fun readFrom(file: RandomAccessFile, indexOffset: Long) {
+    fun readFrom(file: RandomAccessFile, indexOffset: Long) {
         file.seek(indexOffset)
         val count = file.readInt()
         nodes.clear()

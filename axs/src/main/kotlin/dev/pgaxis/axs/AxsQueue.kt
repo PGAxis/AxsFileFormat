@@ -10,61 +10,61 @@ data class QueueEntry(
 )
 
 class WriteQueue {
-  private val queue = LinkedList<QueueEntry>()
-  private val lock = Any()
-  private var processorJob: Job? = null
-  private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val queue = LinkedList<QueueEntry>()
+    private val lock = Any()
+    private var processorJob: Job? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-  fun enqueue(key: String, write: suspend () -> Unit) {
-    synchronized(lock) {
-      queue.removeIf { it.key == key }
-      queue.add(QueueEntry(key, write))
+    fun enqueue(key: String, write: suspend () -> Unit) {
+        synchronized(lock) {
+            queue.removeIf { it.key == key }
+            queue.add(QueueEntry(key, write))
+        }
+        startProcessorIfNeeded()
     }
-    startProcessorIfNeeded()
-  }
 
-  private fun startProcessorIfNeeded() {
-    synchronized(lock) {
-      if (processorJob?.isActive == true) return
-      processorJob = scope.launch { processQueue() }
+    private fun startProcessorIfNeeded() {
+        synchronized(lock) {
+            if (processorJob?.isActive == true) return
+            processorJob = scope.launch { processQueue() }
+        }
     }
-  }
 
-  private suspend fun processQueue() {
-    while (true) {
-      val entry = synchronized(lock) { queue.peek() } ?: return
+    private suspend fun processQueue() {
+        while (true) {
+            val entry = synchronized(lock) { queue.peek() } ?: return
 
-      val age = System.currentTimeMillis() - entry.timestamp
-      val remaining = 300L - age
+            val age = System.currentTimeMillis() - entry.timestamp
+            val remaining = 300L - age
 
-      if (remaining > 0) {
-        delay(remaining)
-      }
+            if (remaining > 0) {
+                delay(timeMillis = remaining)
+            }
 
-      val current = synchronized(lock) { queue.peek() }
-      if (current === entry) {
-        synchronized(lock) { queue.poll() }
-        entry.write()
-      }
+            val current = synchronized(lock) { queue.peek() }
+            if (current === entry) {
+                synchronized(lock) { queue.poll() }
+                entry.write()
+            }
+        }
     }
-  }
 
-  fun cancel() {
-    synchronized(lock) { queue.clear() }
-    runBlocking { processorJob?.cancelAndJoin() }
-  }
-
-  fun flushNow() {
-    runBlocking {
-      processorJob?.cancelAndJoin()
-      val remaining = synchronized(lock) {
-        val copy = queue.toList()
-        queue.clear()
-        copy
-      }
-      for (entry in remaining) {
-        entry.write()
-      }
+    fun cancel() {
+        synchronized(lock) { queue.clear() }
+        runBlocking { processorJob?.cancelAndJoin() }
     }
-  }
+
+    fun flushNow() {
+        runBlocking {
+            processorJob?.cancelAndJoin()
+            val remaining = synchronized(lock) {
+                val copy = queue.toList()
+                queue.clear()
+                copy
+            }
+            for (entry in remaining) {
+                entry.write()
+            }
+        }
+    }
 }

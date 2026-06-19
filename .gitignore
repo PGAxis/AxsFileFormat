@@ -8,6 +8,7 @@ build
 .kotlin
 
 .vscode
+.idea
 local.properties
 secring.asc
 publish.sh
