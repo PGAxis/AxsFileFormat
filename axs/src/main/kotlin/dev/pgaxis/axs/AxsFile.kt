@@ -136,20 +136,22 @@ class AxsFile(private val filePath: String) {
                                             val obj = item as? AxsObject ?: return@mapNotNull null
                                             val constructor = itemType.primaryConstructor
                                                 ?: return@mapNotNull null
-                                            val args =
-                                                constructor.parameters.associateWith { param ->
-                                                    val child = obj.children[param.name]
-                                                        ?: return@mapNotNull null
-                                                    when (param.type.classifier) {
-                                                        String::class -> (child as? AxsString)?.value
-                                                        Int::class -> (child as? AxsInt)?.value
-                                                        Float::class -> (child as? AxsFloat)?.value
-                                                        Double::class -> (child as? AxsDouble)?.value
-                                                        Boolean::class -> (child as? AxsBool)?.value
-                                                        Long::class -> (child as? AxsLong)?.value
-                                                        else -> null
-                                                    }
+                                            val args = constructor.parameters.associateWith { param ->
+                                                val child = obj.children[param.name]
+                                                if (child == null || child is AxsNull) {
+                                                    if (param.type.isMarkedNullable) return@associateWith null
+                                                    else return@mapNotNull null
                                                 }
+                                                when (param.type.classifier) {
+                                                    String::class -> (child as? AxsString)?.value
+                                                    Int::class -> (child as? AxsInt)?.value
+                                                    Float::class -> (child as? AxsFloat)?.value
+                                                    Double::class -> (child as? AxsDouble)?.value
+                                                    Boolean::class -> (child as? AxsBool)?.value
+                                                    Long::class -> (child as? AxsLong)?.value
+                                                    else -> if (param.type.isMarkedNullable) null else return@mapNotNull null
+                                                }
+                                            }
                                             constructor.callBy(args)
                                         } else null
                                     }
@@ -169,8 +171,11 @@ class AxsFile(private val filePath: String) {
                                     val obj = axsValue as? AxsObject ?: continue
                                     val constructor = classifier.primaryConstructor ?: continue
                                     val args = constructor.parameters.associateWith { param ->
-                                        val child =
-                                            obj.children[param.name] ?: return@associateWith null
+                                        val child = obj.children[param.name]
+                                        if (child == null || child is AxsNull) {
+                                            if (param.type.isMarkedNullable) return@associateWith null
+                                            else return@associateWith null // will use default if available
+                                        }
                                         when (param.type.classifier) {
                                             String::class -> (child as? AxsString)?.value
                                             Int::class -> (child as? AxsInt)?.value
@@ -181,7 +186,7 @@ class AxsFile(private val filePath: String) {
                                             Short::class -> (child as? AxsShort)?.value
                                             Char::class -> (child as? AxsChar)?.value
                                             Byte::class -> (child as? AxsByte)?.value
-                                            else -> null
+                                            else -> if (param.type.isMarkedNullable) null else return@associateWith null
                                         }
                                     }
                                     constructor.callBy(args)
