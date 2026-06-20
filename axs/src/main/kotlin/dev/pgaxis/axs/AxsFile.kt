@@ -12,6 +12,7 @@ import kotlin.reflect.full.primaryConstructor
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.reflect.KType
 
 class AxsFile(private val filePath: String) {
     private val MAGIC = byteArrayOf(0x41, 0x58, 0x53, 0x1A)
@@ -122,76 +123,15 @@ class AxsFile(private val filePath: String) {
                         Char::class -> (axsValue as? AxsChar)?.value
                         Byte::class -> (axsValue as? AxsByte)?.value
                         List::class -> {
-                            val itemType = prop.returnType.arguments.firstOrNull()?.type?.classifier
+                            val itemType = prop.returnType.arguments.firstOrNull()?.type ?: return@let
                             (axsValue as? AxsArray)?.items?.mapNotNull { item ->
-                                when (itemType) {
-                                    String::class -> (item as? AxsString)?.value
-                                    Int::class -> (item as? AxsInt)?.value
-                                    Float::class -> (item as? AxsFloat)?.value
-                                    Double::class -> (item as? AxsDouble)?.value
-                                    Boolean::class -> (item as? AxsBool)?.value
-                                    Long::class -> (item as? AxsLong)?.value
-                                    else -> {
-                                        if (itemType is KClass<*>) {
-                                            val obj = item as? AxsObject ?: return@mapNotNull null
-                                            val constructor = itemType.primaryConstructor
-                                                ?: return@mapNotNull null
-                                            val args = constructor.parameters.associateWith { param ->
-                                                val child = obj.children[param.name]
-                                                if (child == null || child is AxsNull) {
-                                                    if (param.type.isMarkedNullable) return@associateWith null
-                                                    else return@mapNotNull null
-                                                }
-                                                when (param.type.classifier) {
-                                                    String::class -> (child as? AxsString)?.value
-                                                    Int::class -> (child as? AxsInt)?.value
-                                                    Float::class -> (child as? AxsFloat)?.value
-                                                    Double::class -> (child as? AxsDouble)?.value
-                                                    Boolean::class -> (child as? AxsBool)?.value
-                                                    Long::class -> (child as? AxsLong)?.value
-                                                    else -> if (param.type.isMarkedNullable) null else return@mapNotNull null
-                                                }
-                                            }
-                                            constructor.callBy(args)
-                                        } else null
-                                    }
-                                }
+                                try { reconstructValue(item, itemType) }
+                                catch (_: Exception) { null }
                             }
                         }
-
                         else -> {
-                            val classifier = prop.returnType.classifier
-                            if (classifier is KClass<*>) {
-                                if (classifier.java.isEnum) {
-                                    val enumValue = (axsValue as? AxsString)?.value
-                                    classifier.java.enumConstants?.firstOrNull { enum ->
-                                        (enum as Enum<*>).name == enumValue
-                                    }
-                                } else {
-                                    val obj = axsValue as? AxsObject ?: continue
-                                    val constructor = classifier.primaryConstructor ?: continue
-                                    val args = constructor.parameters.associateWith { param ->
-                                        val child = obj.children[param.name]
-                                        if (child == null || child is AxsNull) {
-                                            if (param.type.isMarkedNullable) return@associateWith null
-                                            else return@associateWith null // will use default if available
-                                        }
-                                        when (param.type.classifier) {
-                                            String::class -> (child as? AxsString)?.value
-                                            Int::class -> (child as? AxsInt)?.value
-                                            Float::class -> (child as? AxsFloat)?.value
-                                            Double::class -> (child as? AxsDouble)?.value
-                                            Boolean::class -> (child as? AxsBool)?.value
-                                            Long::class -> (child as? AxsLong)?.value
-                                            Short::class -> (child as? AxsShort)?.value
-                                            Char::class -> (child as? AxsChar)?.value
-                                            Byte::class -> (child as? AxsByte)?.value
-                                            else -> if (param.type.isMarkedNullable) null else return@associateWith null
-                                        }
-                                    }
-                                    constructor.callBy(args)
-                                }
-                            } else null
+                            try { reconstructValue(axsValue, prop.returnType) }
+                            catch (_: Exception) { continue }
                         }
                     }
                     if (converted != null) {
@@ -229,6 +169,52 @@ class AxsFile(private val filePath: String) {
                 prop.name to (value?.toAxsValue() ?: AxsNull)
             }
             AxsObject(children)
+        }
+    }
+
+    private fun reconstructValue(child: AxsValue, type: KType): Any? {
+        if (child is AxsNull) {
+            return if (type.isMarkedNullable) null else throw IllegalArgumentException("Non-nullable type got null")
+        }
+        return when (type.classifier) {
+            String::class -> (child as? AxsString)?.value
+            Int::class -> (child as? AxsInt)?.value
+            Float::class -> (child as? AxsFloat)?.value
+            Double::class -> (child as? AxsDouble)?.value
+            Boolean::class -> (child as? AxsBool)?.value
+            Long::class -> (child as? AxsLong)?.value
+            Short::class -> (child as? AxsShort)?.value
+            Char::class -> (child as? AxsChar)?.value
+            Byte::class -> (child as? AxsByte)?.value
+            List::class -> {
+                val itemType = type.arguments.firstOrNull()?.type ?: return null
+                (child as? AxsArray)?.items?.mapNotNull { item ->
+                    try { reconstructValue(item, itemType) }
+                    catch (_: Exception) { null }
+                }
+            }
+            else -> {
+                val classifier = type.classifier
+                if (classifier is KClass<*>) {
+                    if (classifier.java.isEnum) {
+                        val strValue = (child as? AxsString)?.value
+                        classifier.java.enumConstants?.firstOrNull { (it as Enum<*>).name == strValue }
+                    } else {
+                        val obj = child as? AxsObject ?: return null
+                        val constructor = classifier.primaryConstructor ?: return null
+                        val args = constructor.parameters.associateWith { param ->
+                            val paramChild = obj.children[param.name]
+                            if (paramChild == null || paramChild is AxsNull) {
+                                if (param.type.isMarkedNullable) return@associateWith null
+                                else return@associateWith null // will use default if available
+                            }
+                            try { reconstructValue(paramChild, param.type) }
+                            catch (_: Exception) { null }
+                        }
+                        constructor.callBy(args)
+                    }
+                } else null
+            }
         }
     }
 
