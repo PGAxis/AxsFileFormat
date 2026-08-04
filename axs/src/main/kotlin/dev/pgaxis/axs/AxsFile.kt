@@ -1283,45 +1283,55 @@ class AxsFile(private val filePath: String) {
         checkOpen()
         runBlocking {
             fileMutex.withLock {
-                val file = RandomAccessFile(filePath, "rw")
-                file.use {
-                    it.skipBytes(4); it.readByte()
-                    val indexOffset = it.readLong()
-                    val index = AxsIndex()
-                    index.readFrom(it, indexOffset)
+                val tmpPath = "$filePath.tmp"
+                File(filePath).copyTo(File(tmpPath), overwrite = true)
+                try {
+                    val file = RandomAccessFile(tmpPath, "rw")
+                    file.use {
+                        it.skipBytes(4); it.readByte()
+                        val indexOffset = it.readLong()
+                        val index = AxsIndex()
+                        index.readFrom(it, indexOffset)
 
-                    val nodeId = AxsIndex.hashPath(path)
-                    val node = index.find(nodeId) ?: throw AxsKeyNotFoundException(path)
+                        val nodeId = AxsIndex.hashPath(path)
+                        val node = index.find(nodeId) ?: throw AxsKeyNotFoundException(path)
 
-                    if (node.nodeType != NodeType.VALUE) {
-                        val children = index.childrenOf(node.id)
-                        if (children.isNotEmpty() && !recursive)
-                            throw IllegalStateException("$path is non-empty — use recursive = true")
-                    }
-
-                    val valuesToDelete = collectValueNodes(
-                        index,
-                        node
-                    ).sortedByDescending { node -> node.dataOffset }
-                    var totalRemoved = 0L
-
-                    for (valueNode in valuesToDelete) {
-                        val blockSize = (BLOCK_HEADER_SIZE + valueNode.dataSize).toLong()
-                        shiftData(it, valueNode.dataOffset + blockSize, -blockSize)
-                        for (other in index.all()) {
-                            if (other.nodeType == NodeType.VALUE && other.dataOffset > valueNode.dataOffset)
-                                other.dataOffset -= blockSize
+                        if (node.nodeType != NodeType.VALUE) {
+                            val children = index.childrenOf(node.id)
+                            if (children.isNotEmpty() && !recursive)
+                                throw IllegalStateException("$path is non-empty — use recursive = true")
                         }
-                        totalRemoved += blockSize
+
+                        val valuesToDelete = collectValueNodes(index, node)
+                            .sortedByDescending { n -> n.dataOffset }
+                        var totalRemoved = 0L
+
+                        for (valueNode in valuesToDelete) {
+                            val blockSize = (BLOCK_HEADER_SIZE + valueNode.dataSize).toLong()
+                            shiftData(it, valueNode.dataOffset + blockSize, -blockSize)
+                            for (other in index.all()) {
+                                if (other.nodeType == NodeType.VALUE && other.dataOffset > valueNode.dataOffset)
+                                    other.dataOffset -= blockSize
+                            }
+                            totalRemoved += blockSize
+                        }
+
+                        index.remove(node.id)
+                        val newIndexOffset = indexOffset - totalRemoved
+                        it.seek(newIndexOffset)
+                        index.writeTo(it)
+                        it.seek(5)
+                        it.writeLong(newIndexOffset)
+                        it.setLength(newIndexOffset + indexSizeOf(index))
                     }
 
-                    index.remove(node.id)
-                    val newIndexOffset = indexOffset - totalRemoved
-                    it.seek(newIndexOffset)
-                    index.writeTo(it)
-                    it.seek(5)
-                    it.writeLong(newIndexOffset)
-                    it.setLength(newIndexOffset + indexSizeOf(index))
+                    if (!File(tmpPath).renameTo(File(filePath))) {
+                        File(tmpPath).delete()
+                        throw java.io.IOException("delete: atomic replace failed for $filePath")
+                    }
+                } catch (e: Exception) {
+                    File(tmpPath).delete()
+                    throw e
                 }
             }
         }
