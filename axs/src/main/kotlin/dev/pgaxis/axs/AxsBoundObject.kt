@@ -18,9 +18,7 @@ class AxsBoundObject<T : Any>(
         if (!file.isOpen()) throw AxsFileNotOpenException(className)
         prop.set(instance, value)
 
-        writeQueue.enqueue(prop.name) {
-            file.set("$className.${prop.name}", value.toAxsCompatibleValue())
-        }
+        writeQueue.enqueue("$className.${prop.name}", value.toAxsCompatibleValue())
     }
 
     fun flush() {

@@ -18,3 +18,11 @@ application {
 tasks.named<Jar>("jar") {
   archiveBaseName = "axs-lib"
 }
+
+tasks.register<JavaExec>("axsTests") {
+  group = "verification"
+  description = "Runs the AxsFile crash-safety/regression test harness"
+  classpath = sourceSets["main"].runtimeClasspath
+  mainClass.set("dev.pgaxis.axs.tests.AxsTestHarnessKt")
+  args = listOf(project.findProperty("axsTestArgs") as? String ?: "all")
+}

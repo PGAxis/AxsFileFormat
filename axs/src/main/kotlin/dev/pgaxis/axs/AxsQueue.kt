@@ -1,24 +1,26 @@
 package dev.pgaxis.axs
 
 import kotlinx.coroutines.*
-import java.util.LinkedList
+import kotlin.time.Duration.Companion.milliseconds
 
-data class QueueEntry(
-  val key: String,
-  val write: suspend () -> Unit,
-  val timestamp: Long = System.currentTimeMillis()
-)
-
-class WriteQueue {
-    private val queue = LinkedList<QueueEntry>()
+class WriteQueue(
+    private val quietPeriodMs: Long = 100,
+    private val maxBatchDelayMs: Long = 1000,
+    private val maxBatchSize: Int = 500
+) {
+    private val pending = LinkedHashMap<String, AxsValue>()
     private val lock = Any()
+    private var oldestPendingAt: Long = 0
+    private var lastArrivalAt: Long = 0
     private var processorJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    var onFlush: ((Map<String, AxsValue>) -> Unit)? = null
 
-    fun enqueue(key: String, write: suspend () -> Unit) {
+    fun enqueue(path: String, value: AxsValue) {
         synchronized(lock) {
-            queue.removeIf { it.key == key }
-            queue.add(QueueEntry(key, write))
+            if (pending.isEmpty()) oldestPendingAt = System.currentTimeMillis()
+            pending[path] = value
+            lastArrivalAt = System.currentTimeMillis()
         }
         startProcessorIfNeeded()
     }
@@ -26,45 +28,52 @@ class WriteQueue {
     private fun startProcessorIfNeeded() {
         synchronized(lock) {
             if (processorJob?.isActive == true) return
-            processorJob = scope.launch { processQueue() }
+            processorJob = scope.launch { processLoop() }
         }
     }
 
-    private suspend fun processQueue() {
+    private suspend fun processLoop() {
         while (true) {
-            val entry = synchronized(lock) { queue.peek() } ?: return
-
-            val age = System.currentTimeMillis() - entry.timestamp
-            val remaining = 300L - age
-
-            if (remaining > 0) {
-                delay(timeMillis = remaining)
+            val wait = synchronized(lock) {
+                if (pending.isEmpty()) return
+                val now = System.currentTimeMillis()
+                val quietRemaining = quietPeriodMs - (now - lastArrivalAt)
+                val hardRemaining = maxBatchDelayMs - (now - oldestPendingAt)
+                val sizeReady = pending.size >= maxBatchSize
+                if (sizeReady) 0L else maxOf(0L, minOf(quietRemaining, hardRemaining))
             }
 
-            val current = synchronized(lock) { queue.peek() }
-            if (current === entry) {
-                synchronized(lock) { queue.poll() }
-                entry.write()
+            if (wait > 0) delay(wait.milliseconds)
+
+            val batch = synchronized(lock) {
+                if (pending.isEmpty()) return
+                val now = System.currentTimeMillis()
+                val ready = (now - lastArrivalAt >= quietPeriodMs) ||
+                    (now - oldestPendingAt >= maxBatchDelayMs) ||
+                    (pending.size >= maxBatchSize)
+                if (!ready) return@synchronized null
+
+                val copy = LinkedHashMap(pending)
+                pending.clear()
+                copy
             }
+
+            if (!batch.isNullOrEmpty()) onFlush?.invoke(batch)
         }
     }
 
     fun cancel() {
-        synchronized(lock) { queue.clear() }
+        synchronized(lock) { pending.clear() }
         runBlocking { processorJob?.cancelAndJoin() }
     }
 
     fun flushNow() {
-        runBlocking {
-            processorJob?.cancelAndJoin()
-            val remaining = synchronized(lock) {
-                val copy = queue.toList()
-                queue.clear()
-                copy
-            }
-            for (entry in remaining) {
-                entry.write()
-            }
+        runBlocking { processorJob?.cancelAndJoin() }
+        val batch = synchronized(lock) {
+            val copy = LinkedHashMap(pending)
+            pending.clear()
+            copy
         }
+        if (batch.isNotEmpty()) onFlush?.invoke(batch)
     }
 }

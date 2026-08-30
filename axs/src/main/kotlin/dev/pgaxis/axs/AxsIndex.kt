@@ -1,9 +1,10 @@
 package dev.pgaxis.axs
 
-import java.io.RandomAccessFile
+import java.io.DataInput
+import java.io.DataOutput
 
 enum class NodeType(val value: Byte) {
-    OBJECT(0), ARRAY(1), VALUE(2);
+    OBJECT(0), ARRAY(1), VALUE(2), FREE(3);
     companion object { fun from(b: Byte) = entries.first { it.value == b } }
 }
 
@@ -24,11 +25,14 @@ data class AxsNode(
 )
 
 class AxsIndex {
-    private val nodes = mutableListOf<AxsNode>()
+    private val nodesById = LinkedHashMap<Long, AxsNode>()
+    private val childrenByParent = HashMap<Long, MutableList<Long>>()
+    private val freeIdsBySize = HashMap<Int, MutableList<Long>>()
 
     companion object {
         const val ROOT_ID = 0L
         const val NO_PARENT = -1L
+        const val FREE_LIST_ID = -2L
 
         fun hashPath(path: String): Long {
             var hash = -3750763034362895579L
@@ -37,67 +41,90 @@ class AxsIndex {
             }
             return hash
         }
+
+        fun freeId(offset: Long): Long = hashPath("__free__$offset")
     }
 
     init {
-        nodes.add(AxsNode(ROOT_ID, NO_PARENT, NodeType.OBJECT, "root"))
+        addInternal(AxsNode(ROOT_ID, NO_PARENT, NodeType.OBJECT, "root"))
     }
 
-    fun find(id: Long): AxsNode? = nodes.find { it.id == id }
+    fun find(id: Long): AxsNode? = nodesById[id]
 
     fun findByPath(path: String): AxsNode? = find(hashPath(path))
 
-    fun childrenOf(parentId: Long): List<AxsNode> = nodes.filter { it.parentId == parentId }
+    fun childrenOf(parentId: Long): List<AxsNode> =
+        childrenByParent[parentId]?.mapNotNull { nodesById[it] } ?: emptyList()
 
-    fun add(node: AxsNode) {
-        nodes.add(node)
+    fun findFreeBlockOfSize(size: Int): AxsNode? =
+        freeIdsBySize[size]?.firstOrNull()?.let { nodesById[it] }
+
+    fun freeBlocks(): List<AxsNode> = freeIdsBySize.values.flatten().mapNotNull { nodesById[it] }
+
+    private fun addInternal(node: AxsNode) {
+        nodesById[node.id] = node
+        childrenByParent.getOrPut(node.parentId) { mutableListOf() }.add(node.id)
+        if (node.nodeType == NodeType.FREE) {
+            freeIdsBySize.getOrPut(node.dataSize) { mutableListOf() }.add(node.id)
+        }
     }
+
+    fun add(node: AxsNode) = addInternal(node)
 
     fun remove(id: Long): Boolean {
-        childrenOf(id).forEach { remove(it.id) }
-        return nodes.removeIf { it.id == id }
+        val node = nodesById[id] ?: return false
+
+        childrenByParent[id]?.toList()?.forEach { remove(it) }
+        childrenByParent.remove(id)
+
+        childrenByParent[node.parentId]?.remove(id)
+        if (node.nodeType == NodeType.FREE) {
+            freeIdsBySize[node.dataSize]?.remove(id)
+        }
+        return nodesById.remove(id) != null
     }
 
-    fun all(): List<AxsNode> = nodes.toList()
+    fun all(): List<AxsNode> = nodesById.values.toList()
 
-    fun readFrom(file: RandomAccessFile, indexOffset: Long) {
-        file.seek(indexOffset)
-        val count = file.readInt()
-        nodes.clear()
+    fun readFromBytes(din: DataInput) {
+        val count = din.readInt()
+        nodesById.clear()
+        childrenByParent.clear()
+        freeIdsBySize.clear()
         repeat(count) {
-            val id = file.readLong()
-            val parentId = file.readLong()
-            val nodeType = NodeType.from(file.readByte())
-            val nameLength = file.readShort().toInt()
+            val id = din.readLong()
+            val parentId = din.readLong()
+            val nodeType = NodeType.from(din.readByte())
+            val nameLength = din.readUnsignedShort()
             val nameBytes = ByteArray(nameLength)
-            file.readFully(nameBytes)
+            din.readFully(nameBytes)
             val name = String(nameBytes, Charsets.UTF_8)
 
-            val node = if (nodeType == NodeType.VALUE) {
-                val dataOffset = file.readLong()
-                val dataSize = file.readInt()
-                val valueType = ValueType.from(file.readByte())
+            val node = if (nodeType == NodeType.VALUE || nodeType == NodeType.FREE) {
+                val dataOffset = din.readLong()
+                val dataSize = din.readInt()
+                val valueType = ValueType.from(din.readByte())
                 AxsNode(id, parentId, nodeType, name, dataOffset, dataSize, valueType)
             } else {
                 AxsNode(id, parentId, nodeType, name)
             }
-            nodes.add(node)
+            addInternal(node)
         }
     }
 
-    fun writeTo(file: RandomAccessFile) {
-        file.writeInt(nodes.size)
-        for (node in nodes) {
-            file.writeLong(node.id)
-            file.writeLong(node.parentId)
-            file.writeByte(node.nodeType.value.toInt())
+    fun writeTo(out: DataOutput) {
+        out.writeInt(nodesById.size)
+        for (node in nodesById.values) {
+            out.writeLong(node.id)
+            out.writeLong(node.parentId)
+            out.writeByte(node.nodeType.value.toInt())
             val nameBytes = node.name.toByteArray(Charsets.UTF_8)
-            file.writeShort(nameBytes.size)
-            file.write(nameBytes)
-            if (node.nodeType == NodeType.VALUE) {
-                file.writeLong(node.dataOffset)
-                file.writeInt(node.dataSize)
-                file.writeByte(node.valueType.value.toInt())
+            out.writeShort(nameBytes.size)
+            out.write(nameBytes)
+            if (node.nodeType == NodeType.VALUE || node.nodeType == NodeType.FREE) {
+                out.writeLong(node.dataOffset)
+                out.writeInt(node.dataSize)
+                out.writeByte(node.valueType.value.toInt())
             }
         }
     }
