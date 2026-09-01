@@ -14,6 +14,7 @@ class WriteQueue(
     private var lastArrivalAt: Long = 0
     private var processorJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     var onFlush: ((Map<String, AxsValue>) -> Unit)? = null
 
     fun enqueue(path: String, value: AxsValue) {
@@ -49,8 +50,8 @@ class WriteQueue(
                 if (pending.isEmpty()) return
                 val now = System.currentTimeMillis()
                 val ready = (now - lastArrivalAt >= quietPeriodMs) ||
-                    (now - oldestPendingAt >= maxBatchDelayMs) ||
-                    (pending.size >= maxBatchSize)
+                        (now - oldestPendingAt >= maxBatchDelayMs) ||
+                        (pending.size >= maxBatchSize)
                 if (!ready) return@synchronized null
 
                 val copy = LinkedHashMap(pending)

@@ -5,10 +5,10 @@ import kotlin.reflect.KProperty1
 import kotlin.reflect.full.memberProperties
 
 class AxsBoundObject<T : Any>(
-  private val file: AxsFile,
-  private var instance: T,
-  private val className: String,
-  private val writeQueue: WriteQueue
+    private val file: AxsFile,
+    private var instance: T,
+    private val className: String,
+    private val writeQueue: WriteQueue
 ) {
     fun <V> getValue(prop: KProperty1<T, V>): V {
         return prop.get(instance)

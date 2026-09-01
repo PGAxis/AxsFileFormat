@@ -2,6 +2,7 @@ package dev.pgaxis.axs
 
 import java.io.DataInput
 import java.io.DataOutput
+import java.util.TreeMap
 
 enum class NodeType(val value: Byte) {
     OBJECT(0), ARRAY(1), VALUE(2), FREE(3);
@@ -27,7 +28,7 @@ data class AxsNode(
 class AxsIndex {
     private val nodesById = LinkedHashMap<Long, AxsNode>()
     private val childrenByParent = HashMap<Long, MutableList<Long>>()
-    private val freeIdsBySize = HashMap<Int, MutableList<Long>>()
+    private val freeIdsBySize = TreeMap<Int, MutableList<Long>>()
 
     companion object {
         const val ROOT_ID = 0L
@@ -56,8 +57,13 @@ class AxsIndex {
     fun childrenOf(parentId: Long): List<AxsNode> =
         childrenByParent[parentId]?.mapNotNull { nodesById[it] } ?: emptyList()
 
-    fun findFreeBlockOfSize(size: Int): AxsNode? =
-        freeIdsBySize[size]?.firstOrNull()?.let { nodesById[it] }
+    fun findBestFitFreeBlock(minSize: Int, eligibleIds: Set<Long>): AxsNode? {
+        for ((_, ids) in freeIdsBySize.tailMap(minSize)) {
+            val id = ids.firstOrNull { it in eligibleIds } ?: continue
+            return nodesById[id]
+        }
+        return null
+    }
 
     fun freeBlocks(): List<AxsNode> = freeIdsBySize.values.flatten().mapNotNull { nodesById[it] }
 
@@ -79,7 +85,9 @@ class AxsIndex {
 
         childrenByParent[node.parentId]?.remove(id)
         if (node.nodeType == NodeType.FREE) {
-            freeIdsBySize[node.dataSize]?.remove(id)
+            val bucket = freeIdsBySize[node.dataSize]
+            bucket?.remove(id)
+            if (bucket != null && bucket.isEmpty()) freeIdsBySize.remove(node.dataSize)
         }
         return nodesById.remove(id) != null
     }

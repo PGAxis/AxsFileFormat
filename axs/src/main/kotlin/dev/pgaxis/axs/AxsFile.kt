@@ -61,13 +61,6 @@ class AxsFile(private val filePath: String) {
         isFileOpen = true
     }
 
-    /**
-     * One-time migration from the v4 on-disk format (single header, pointing at
-     * one index blob, no dual-superblock/COW) to v5.
-     *
-     * A value block that already fails its own CRC in the old file is dropped rather
-     * than blocking migration of everything else.
-     */
     private fun migrateFromLegacyV4() {
         val legacyIndex = AxsIndex()
         val looksLikeLegacy = RandomAccessFile(filePath, "r").use { raf ->
@@ -160,22 +153,31 @@ class AxsFile(private val filePath: String) {
         return index
     }
 
-    private fun commitIndex(raf: RandomAccessFile, currentSlot: Int, currentGeneration: Long, index: AxsIndex): Int =
-        commitStructuralChange(raf, index, MAGIC, VERSION, currentSlot, currentGeneration)
+    private fun commitIndex(
+        raf: RandomAccessFile,
+        currentSlot: Int,
+        sb: AxsSuperblock,
+        index: AxsIndex
+    ): Int {
+        return commitStructuralChange(
+            raf, index, MAGIC, VERSION, currentSlot, sb.generation,
+            reuseHintOffset = sb.previousIndexOffset, reuseHintLength = sb.previousIndexLength,
+            supersededIndexOffset = sb.indexOffset, supersededIndexLength = sb.indexLength
+        )
+    }
+
+    private fun eligibleFreeIdsOf(index: AxsIndex): Set<Long> =
+        index.freeBlocks().map { it.id }.toHashSet()
 
     private fun parentIdOf(path: String): Long {
         val segments = path.split(".")
         return if (segments.size > 1) AxsIndex.hashPath(segments.dropLast(1).joinToString(".")) else AxsIndex.ROOT_ID
     }
 
-    /**
-     * Writes one leaf value. Returns true if the index/superblock had to change
-     * (caller must commitIndex), false if it was a same-size in-place overwrite
-     * that's already fully durable on its own.
-     */
     private fun writeValueEntry(
         raf: RandomAccessFile,
         index: AxsIndex,
+        eligibleFreeIds: Set<Long>,
         path: String,
         dataBytes: ByteArray,
         valueType: ValueType
@@ -195,14 +197,32 @@ class AxsFile(private val filePath: String) {
                 AxsNode(
                     id = AxsIndex.freeId(existingNode.dataOffset), parentId = AxsIndex.FREE_LIST_ID,
                     nodeType = NodeType.FREE, name = "",
-                    dataOffset = existingNode.dataOffset, dataSize = existingNode.dataSize
+                    dataOffset = existingNode.dataOffset, dataSize = AXS_BLOCK_HEADER_SIZE + existingNode.dataSize
                 )
             )
         }
 
-        val reusable = index.findFreeBlockOfSize(dataBytes.size)
-        val offset = reusable?.dataOffset ?: raf.length()
-        if (reusable != null) index.remove(reusable.id)
+        val required = AXS_BLOCK_HEADER_SIZE + dataBytes.size
+        val reusable = index.findBestFitFreeBlock(required, eligibleFreeIds)
+        val offset: Long
+        if (reusable != null) {
+            offset = reusable.dataOffset
+            index.remove(reusable.id)
+
+            val leftoverRaw = reusable.dataSize - required
+            if (leftoverRaw >= AXS_BLOCK_HEADER_SIZE) {
+                val leftoverOffset = offset + required
+                index.add(
+                    AxsNode(
+                        id = AxsIndex.freeId(leftoverOffset), parentId = AxsIndex.FREE_LIST_ID,
+                        nodeType = NodeType.FREE, name = "",
+                        dataOffset = leftoverOffset, dataSize = leftoverRaw
+                    )
+                )
+            }
+        } else {
+            offset = raf.length()
+        }
 
         appendValueBlock(raf, offset, dataBytes, valueType)
 
@@ -218,8 +238,7 @@ class AxsFile(private val filePath: String) {
         return true
     }
 
-    /** Writes one entry of a bulk tree (see setBulk/collectEntries) into an already-open transaction. */
-    private fun writeEntry(raf: RandomAccessFile, index: AxsIndex, path: String, value: AxsValue): Boolean {
+    private fun writeEntry(raf: RandomAccessFile, index: AxsIndex, eligibleFreeIds: Set<Long>, path: String, value: AxsValue): Boolean {
         ensureParentNodes(index, path)
         val nodeId = AxsIndex.hashPath(path)
         val parentId = parentIdOf(path)
@@ -238,10 +257,10 @@ class AxsFile(private val filePath: String) {
                     true
                 } else false
             }
-            is AxsNull -> writeValueEntry(raf, index, path, ByteArray(0), ValueType.NULL)
+            is AxsNull -> writeValueEntry(raf, index, eligibleFreeIds, path, ByteArray(0), ValueType.NULL)
             else -> {
                 val (raw, valueType) = primitiveToRaw(value)
-                writeValueEntry(raf, index, path, raw.toByteArray(Charsets.UTF_8), valueType)
+                writeValueEntry(raf, index, eligibleFreeIds, path, raw.toByteArray(Charsets.UTF_8), valueType)
             }
         }
     }
@@ -316,7 +335,7 @@ class AxsFile(private val filePath: String) {
         return AxsBoundObject(this, instance, className, writeQueue)
     }
 
-    // ---------- Private helpers ----------
+    // ---------- Private helpers (format-independent - unchanged from before) ----------
     private fun Any.toAxsValue(): AxsValue = when (this) {
         is String -> axsValueOf(this)
         is Int -> axsValueOf(this)
@@ -425,13 +444,6 @@ class AxsFile(private val filePath: String) {
         )
     }
 
-    /**
-     * Reads a node, degrading gracefully instead of throwing: a value block that's
-     * mid-write or fails its CRC becomes AxsNull (-> caller's default) rather than
-     * failing the whole read. A corrupted item inside a List just gets dropped by
-     * the mapNotNull in bind()/reconstructValue - everything else in the tree is
-     * unaffected.
-     */
     private fun readNode(
         raf: RandomAccessFile,
         index: AxsIndex,
@@ -527,7 +539,7 @@ class AxsFile(private val filePath: String) {
                         )
                     )
 
-                    commitIndex(raf, slotIdx, sb.generation, index)
+                    commitIndex(raf, slotIdx, sb, index)
                 }
             }
         }
@@ -554,7 +566,7 @@ class AxsFile(private val filePath: String) {
         return errors
     }
 
-    private fun importDir(raf: RandomAccessFile, index: AxsIndex, dir: File, parentPath: String, force: Boolean) {
+    private fun importDir(raf: RandomAccessFile, index: AxsIndex, eligibleFreeIds: Set<Long>, dir: File, parentPath: String, force: Boolean) {
         val isArray = File(dir, "_array").exists()
         for (entry in (dir.listFiles() ?: return).sortedBy { it.name }) {
             if (entry.name == "_array") continue
@@ -573,7 +585,7 @@ class AxsFile(private val filePath: String) {
                         )
                     )
                 }
-                importDir(raf, index, entry, entryPath, force)
+                importDir(raf, index, eligibleFreeIds, entry, entryPath, force)
             } else if (entry.isFile) {
                 val parts = entry.name.split(".")
                 if (parts.size < 3) continue
@@ -586,7 +598,7 @@ class AxsFile(private val filePath: String) {
 
                 val cleanPath = if (parentPath.isEmpty()) name else "$parentPath.$name"
                 val dataBytes = entry.readText().toByteArray(Charsets.UTF_8)
-                writeValueEntry(raf, index, cleanPath, dataBytes, valueType)
+                writeValueEntry(raf, index, eligibleFreeIds, cleanPath, dataBytes, valueType)
             }
         }
     }
@@ -664,7 +676,6 @@ class AxsFile(private val filePath: String) {
         }
     }
 
-    /** Low-level primitive setter - used directly by callers that already know the ValueType. */
     fun set(path: String, value: String, valueType: ValueType = ValueType.STRING) {
         checkOpen()
         runBlocking {
@@ -672,8 +683,9 @@ class AxsFile(private val filePath: String) {
                 RandomAccessFile(filePath, "rw").use { raf ->
                     val (slotIdx, sb) = loadActive(raf)
                     val index = loadIndex(raf, sb)
-                    val changed = writeValueEntry(raf, index, path, value.toByteArray(Charsets.UTF_8), valueType)
-                    if (changed) commitIndex(raf, slotIdx, sb.generation, index)
+                    val eligibleFreeIds = eligibleFreeIdsOf(index)
+                    val changed = writeValueEntry(raf, index, eligibleFreeIds, path, value.toByteArray(Charsets.UTF_8), valueType)
+                    if (changed) commitIndex(raf, slotIdx, sb, index)
                 }
             }
         }
@@ -708,8 +720,9 @@ class AxsFile(private val filePath: String) {
                 RandomAccessFile(filePath, "rw").use { raf ->
                     val (slotIdx, sb) = loadActive(raf)
                     val index = loadIndex(raf, sb)
-                    val changed = writeValueEntry(raf, index, path, ByteArray(0), ValueType.NULL)
-                    if (changed) commitIndex(raf, slotIdx, sb.generation, index)
+                    val eligibleFreeIds = eligibleFreeIdsOf(index)
+                    val changed = writeValueEntry(raf, index, eligibleFreeIds, path, ByteArray(0), ValueType.NULL)
+                    if (changed) commitIndex(raf, slotIdx, sb, index)
                 }
             }
         }
@@ -724,13 +737,14 @@ class AxsFile(private val filePath: String) {
                 RandomAccessFile(filePath, "rw").use { raf ->
                     val (slotIdx, sb) = loadActive(raf)
                     val index = loadIndex(raf, sb)
+                    val eligibleFreeIds = eligibleFreeIdsOf(index)
 
                     var changed = false
                     for ((entryPath, value) in entries) {
-                        if (writeEntry(raf, index, entryPath, value)) changed = true
+                        if (writeEntry(raf, index, eligibleFreeIds, entryPath, value)) changed = true
                     }
 
-                    if (changed) commitIndex(raf, slotIdx, sb.generation, index)
+                    if (changed) commitIndex(raf, slotIdx, sb, index)
                 }
             }
         }
@@ -758,14 +772,6 @@ class AxsFile(private val filePath: String) {
         }
     }
 
-    /**
-     * Writes many independent paths as ONE commit - unlike setAll(), this is a
-     * partial update: anything not in `values` is left completely untouched.
-     * This is what WriteQueue's batches land on, so that N coalesced property
-     * writes cost one index rewrite instead of N. Each value is expanded the
-     * same way setBulk() expands one (nested objects/arrays get their full
-     * subtree written, not just the top-level marker).
-     */
     fun setBatch(values: Map<String, AxsValue>) {
         if (values.isEmpty()) return
         checkOpen()
@@ -778,13 +784,14 @@ class AxsFile(private val filePath: String) {
                 RandomAccessFile(filePath, "rw").use { raf ->
                     val (slotIdx, sb) = loadActive(raf)
                     val index = loadIndex(raf, sb)
+                    val eligibleFreeIds = eligibleFreeIdsOf(index)
 
                     var changed = false
                     for ((path, value) in entries) {
-                        if (writeEntry(raf, index, path, value)) changed = true
+                        if (writeEntry(raf, index, eligibleFreeIds, path, value)) changed = true
                     }
 
-                    if (changed) commitIndex(raf, slotIdx, sb.generation, index)
+                    if (changed) commitIndex(raf, slotIdx, sb, index)
                 }
             }
         }
@@ -797,23 +804,27 @@ class AxsFile(private val filePath: String) {
                 RandomAccessFile(filePath, "rw").use { raf ->
                     val (slotIdx, sb) = loadActive(raf)
                     val oldIndex = loadIndex(raf, sb)
+                    val eligibleFreeIds = eligibleFreeIdsOf(oldIndex)
 
                     val newIndex = AxsIndex()
+                    for (old in oldIndex.freeBlocks()) {
+                        newIndex.add(old.copy())
+                    }
                     for (old in oldIndex.all()) {
                         if (old.nodeType == NodeType.VALUE) {
                             newIndex.add(
                                 AxsNode(
                                     id = AxsIndex.freeId(old.dataOffset), parentId = AxsIndex.FREE_LIST_ID,
                                     nodeType = NodeType.FREE, name = "",
-                                    dataOffset = old.dataOffset, dataSize = old.dataSize
+                                    dataOffset = old.dataOffset, dataSize = AXS_BLOCK_HEADER_SIZE + old.dataSize
                                 )
                             )
                         }
                     }
 
-                    for ((path, value) in values) writeEntry(raf, newIndex, path, value)
+                    for ((path, value) in values) writeEntry(raf, newIndex, eligibleFreeIds, path, value)
 
-                    commitIndex(raf, slotIdx, sb.generation, newIndex)
+                    commitIndex(raf, slotIdx, sb, newIndex)
                 }
             }
         }
@@ -871,8 +882,9 @@ class AxsFile(private val filePath: String) {
                 RandomAccessFile(filePath, "rw").use { raf ->
                     val (slotIdx, sb) = loadActive(raf)
                     val index = loadIndex(raf, sb)
-                    importDir(raf, index, dir, "", force)
-                    commitIndex(raf, slotIdx, sb.generation, index)
+                    val eligibleFreeIds = eligibleFreeIdsOf(index)
+                    importDir(raf, index, eligibleFreeIds, dir, "", force)
+                    commitIndex(raf, slotIdx, sb, index)
                 }
             }
         }
@@ -900,31 +912,18 @@ class AxsFile(private val filePath: String) {
                             AxsNode(
                                 id = AxsIndex.freeId(valueNode.dataOffset), parentId = AxsIndex.FREE_LIST_ID,
                                 nodeType = NodeType.FREE, name = "",
-                                dataOffset = valueNode.dataOffset, dataSize = valueNode.dataSize
+                                dataOffset = valueNode.dataOffset, dataSize = AXS_BLOCK_HEADER_SIZE + valueNode.dataSize
                             )
                         )
                     }
                     index.remove(node.id)
 
-                    commitIndex(raf, slotIdx, sb.generation, index)
+                    commitIndex(raf, slotIdx, sb, index)
                 }
             }
         }
     }
 
-    /**
-     * Rewrites the file from scratch, compacted: every live value packed with no
-     * gaps, the free list emptied, file size shrunk to what's actually live.
-     *
-     * Note this is still not lossy on interruption: a kill mid-defragment leaves
-     * an incomplete `.tmp` file, which is simply discarded - the original file is
-     * never touched until the very last, atomic rename. Worst case, a defragment
-     * just didn't happen; nothing already committed is at risk.
-     *
-     * A value block that's already unrecoverable (mid-write/CRC-failed before this
-     * even gets called) is dropped rather than propagated into the compacted file,
-     * consistent with how a normal read treats it.
-     */
     fun defragment() {
         checkOpen()
         runBlocking {
@@ -944,11 +943,8 @@ class AxsFile(private val filePath: String) {
                                 when (node.nodeType) {
                                     NodeType.FREE -> {}
                                     NodeType.VALUE -> {
-                                        val bytes = readValueBlockOrNull(
-                                            src,
-                                            node.dataOffset,
-                                            node.dataSize
-                                        ) ?: continue
+                                        val bytes = readValueBlockOrNull(src, node.dataOffset, node.dataSize)
+                                        if (bytes == null) continue // already-corrupted - drop, don't propagate
                                         appendValueBlock(dst, cursor, bytes, node.valueType)
                                         newIndex.add(node.copy(dataOffset = cursor, dataSize = bytes.size))
                                         cursor += AXS_BLOCK_HEADER_SIZE + bytes.size

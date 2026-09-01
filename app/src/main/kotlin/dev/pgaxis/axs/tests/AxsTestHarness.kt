@@ -19,7 +19,7 @@ private fun report(name: String, passed: Boolean, detail: String = "") {
 
 private fun freshPath(name: String): String {
     val f = File.createTempFile("axstest_$name", ".axs")
-    f.delete()
+    f.delete() // we want the path, not an empty file - AxsFile.open() creates it
     f.deleteOnExit()
     return f.absolutePath
 }
@@ -41,6 +41,9 @@ fun main(args: Array<String>) {
         "defrag-kill" -> testDefragmentKill()
         "corrupt" -> testCorruptedRead()
         "batching" -> testWriteQueueBatching()
+        "splitting" -> testFreeSpaceSplitting()
+        "index-reuse" -> testIndexSpaceReuseBoundedGrowth()
+        "reuse-hazard" -> testSameTransactionReuseHazard()
         "all" -> {
             testSimpleWriteRead()
             testLongWrite()
@@ -49,9 +52,12 @@ fun main(args: Array<String>) {
             testDefragmentKill()
             testCorruptedRead()
             testWriteQueueBatching()
+            testFreeSpaceSplitting()
+            testIndexSpaceReuseBoundedGrowth()
+            testSameTransactionReuseHazard()
         }
         else -> {
-            println("Unknown test '$which'. Options: simple, long, long-kill, defrag, defrag-kill, corrupt, batching, migration, all")
+            println("Unknown test '$which'. Options: simple, long, long-kill, defrag, defrag-kill, corrupt, batching, migration, splitting, index-reuse, reuse-hazard, all")
             return
         }
     }
@@ -61,6 +67,11 @@ fun main(args: Array<String>) {
     println("=== $passed/${results.size} tests passed ===")
     if (passed != results.size) exitProcess(1)
 }
+
+// ---------- worker subprocess (used by the two kill tests) ----------
+// Runs in a completely separate JVM process so destroyForcibly() is a real
+// SIGKILL, not just an interrupted thread - the same failure mode as Android
+// force-stopping the app mid-write.
 
 private fun runWorker(args: List<String>) {
     when (args[0]) {
@@ -162,23 +173,24 @@ private fun testLongWriteKill() {
     for (t in 0 until trials) {
         val path = freshPath("longkill_$t")
         try {
+            // Known-good, fully committed baseline before the kill happens.
             val baseline = AxsFile(path)
             baseline.open()
             for (i in 0 until 50) baseline.set("baseline.$i", "base-$i")
             baseline.close()
 
             val proc = spawnWorker("long-write", path)
-            Thread.sleep(Random.nextLong(5, 60))
+            Thread.sleep(Random.nextLong(5, 60)) // vary where in the write loop the kill lands
             proc.destroyForcibly()
             proc.waitFor()
 
             val check = AxsFile(path)
-            check.open()
+            check.open() // must not throw - this alone is most of the claim
             var baselineOk = true
             for (i in 0 until 50) {
                 if ((check.get("baseline.$i") as? AxsString)?.value != "base-$i") baselineOk = false
             }
-            check.debugDumpIndex()
+            check.debugDumpIndex() // exercises reading whatever partial worker state exists too
             check.close()
 
             if (baselineOk) kept++ else failures.add("trial $t: baseline damaged after kill")
@@ -194,7 +206,7 @@ private fun testLongWriteKill() {
         "long write + kill mid-write ($trials trials)",
         kept == trials,
         "$kept/$trials trials kept the pre-existing committed data intact" +
-            if (failures.isNotEmpty()) "; " + failures.joinToString("; ") else ""
+                if (failures.isNotEmpty()) "; " + failures.joinToString("; ") else ""
     )
 }
 
@@ -205,9 +217,12 @@ private fun testDefragment() {
     try {
         val a = AxsFile(path)
         a.open()
+        // Populate in one commit (setAll) rather than 2000 individual set() calls -
+        // see the "long write" test's file-size finding for why that distinction
+        // matters. What's under test here is defragment(), not commit overhead.
         val seed = (0 until 2000).associate { "item.$it" to axsValueOf("value-$it-".repeat(5)) }
         a.setAll(seed)
-        for (i in 0 until 2000 step 2) a.delete("item.$i")
+        for (i in 0 until 2000 step 2) a.delete("item.$i") // free every other one
         val sizeBefore = File(path).length()
 
         a.defragment()
@@ -218,7 +233,7 @@ private fun testDefragment() {
             if ((a.get("item.$i") as? AxsString)?.value != "value-$i-".repeat(5)) dataOk = false
         }
         for (i in 0 until 2000 step 2) {
-            if (a.get("item.$i") != null) dataOk = false
+            if (a.get("item.$i") != null) dataOk = false // deleted ones must stay gone
         }
         val dump = a.debugDumpIndex()
         val freeListEmpty = dump.none { it.contains("Free list") }
@@ -249,6 +264,12 @@ private fun testDefragmentKill() {
         try {
             val a = AxsFile(path)
             a.open()
+            // Populate in one commit (setAll), not 20,000 individual set() calls -
+            // individual top-level set()s each pay for a full index rewrite (see the
+            // "long write" test), so 20,000 of them would make *setup* the slow part
+            // instead of defragment() itself. One commit gets us a large enough live
+            // dataset that defragment's copy loop has a real multi-hundred-ms window,
+            // without that unrelated cost.
             val seed = (0 until 100_000).associate { "item.$it" to axsValueOf("payload-$it-".repeat(10)) }
             a.setAll(seed)
             a.close()
@@ -260,16 +281,18 @@ private fun testDefragmentKill() {
             }
 
             val proc = spawnWorker("defragment", path)
-            Thread.sleep(Random.nextLong(20, 400))
+            Thread.sleep(Random.nextLong(20, 400)) // defragment(100k) takes ~700ms locally
             val stillRunning = proc.isAlive
             proc.destroyForcibly()
             proc.waitFor()
             if (stillRunning) confirmedMidFlight++
 
+            // Leftover .tmp from an interrupted defragment is harmless debris -
+            // nothing reads it - but clean it up for hygiene before reopening.
             File("$path.tmp").delete()
 
             val check = AxsFile(path)
-            check.open()
+            check.open() // the ORIGINAL file - must not throw regardless of kill timing
             var dataOk = true
             for ((i, expected) in sample) {
                 if ((check.get("item.$i") as? AxsString)?.value != expected) dataOk = false
@@ -289,8 +312,8 @@ private fun testDefragmentKill() {
         "defragment + kill mid-process ($trials trials)",
         kept == trials,
         "$kept/$trials preserved the original file untouched " +
-            "($confirmedMidFlight/$trials confirmed still mid-flight at kill time)" +
-            if (failures.isNotEmpty()) "; " + failures.joinToString("; ") else ""
+                "($confirmedMidFlight/$trials confirmed still mid-flight at kill time)" +
+                if (failures.isNotEmpty()) "; " + failures.joinToString("; ") else ""
     )
 }
 
@@ -327,7 +350,7 @@ private fun testWriteQueueBatching() {
     try {
         val a = AxsFile(path)
         a.open()
-        a.bind(Prefs())
+        a.bind(Prefs()) // creates the class's default object - its own commit(s)
         a.close()
 
         val genBefore = generationOf(path)
@@ -340,7 +363,7 @@ private fun testWriteQueueBatching() {
         bound.setValue(Prefs::lastTrack, "song.mp3")
         bound.setValue(Prefs::brightness, 50)
         bound.setValue(Prefs::name, "MyDevice")
-        Thread.sleep(400)
+        Thread.sleep(400) // past the quiet period, batch should have flushed once
         b.close()
 
         val genAfter = generationOf(path)
@@ -366,6 +389,167 @@ private fun testWriteQueueBatching() {
     }
 }
 
+// ---------- 8. best-fit free-block reuse with splitting ----------
+
+private fun testFreeSpaceSplitting() {
+    val path = freshPath("splitting")
+    try {
+        val a = AxsFile(path)
+        a.open()
+
+        // One big value, then delete it - leaves one large free block (plus,
+        // now that old index generations get freed too, some small unrelated
+        // free entries from prior commits' index blobs - identify the one that
+        // actually corresponds to "big" by its expected total span rather than
+        // assuming it's first in the list).
+        a.set("big", "X".repeat(1000))
+        a.delete("big")
+        val sizeAfterFree = File(path).length()
+        val expectedBigBlockSpan = AXS_BLOCK_HEADER_SIZE + 1000
+        val freeSizes = a.debugDumpIndex()
+            .filter { it.trim().startsWith("offset=") }
+            .map { Regex("""size=(\d+)""").find(it)!!.groupValues[1].toInt() }
+        val bigBlockFound = expectedBigBlockSpan in freeSizes
+
+        // Batched into ONE commit deliberately: three separate top-level set()
+        // calls would each pay for their own index rewrite (a different, already-known
+        // cost - see the "long write" test), which would swamp the much
+        // smaller effect we're actually isolating here: whether the VALUE bytes
+        // themselves get reused out of the freed hole instead of appended fresh.
+        a.setBatch(
+            mapOf(
+                "small1" to axsValueOf("aaaa"),      // 4 bytes
+                "small2" to axsValueOf("bbbbbbbb"),  // 8 bytes
+                "small3" to axsValueOf("cc")         // 2 bytes
+            )
+        )
+        val sizeAfterSmallWrites = File(path).length()
+
+        val dataOk = (a.get("small1") as? AxsString)?.value == "aaaa" &&
+                (a.get("small2") as? AxsString)?.value == "bbbbbbbb" &&
+                (a.get("small3") as? AxsString)?.value == "cc"
+
+        val bigSpanStillFree = a.debugDumpIndex()
+            .filter { it.trim().startsWith("offset=") }
+            .map { Regex("""size=(\d+)""").find(it)!!.groupValues[1].toInt() }
+            .any { it == expectedBigBlockSpan } // should be GONE/shrunk now, not still 1010
+
+        a.close()
+
+        // 3 payloads (4+8+2=14) plus 3 block headers (3*10=30) = 44 bytes should
+        // have come out of the freed 1010-byte hole (split down to a smaller
+        // remainder), not appended fresh at EOF (which would cost the full 14
+        // bytes of new *file* growth on top of everything already there, same
+        // as before this feature existed).
+        val growth = sizeAfterSmallWrites - sizeAfterFree
+
+        report(
+            "free space reused via best-fit + splitting",
+            dataOk && bigBlockFound && !bigSpanStillFree && growth < 500,
+            "big's freed block (span=$expectedBigBlockSpan) found pre-write=$bigBlockFound, " +
+                    "consumed/split by small writes=${!bigSpanStillFree}, fileGrowth=${growth}B dataOk=$dataOk"
+        )
+    } catch (e: Exception) {
+        report("free space reused via best-fit + splitting", false, "threw: $e")
+    } finally {
+        File(path).delete()
+    }
+}
+
+// ---------- 9. index space reuse under realistic churn (bounded growth) ----------
+
+private fun testIndexSpaceReuseBoundedGrowth() {
+    val path = freshPath("index-reuse")
+    try {
+        val a = AxsFile(path)
+        a.open()
+
+        // Seed a modest, STABLE set of keys - this is the realistic pattern
+        // (bound settings, a fixed-ish set of fields updated over time), not
+        // the "always brand-new keys" pattern the "long write" test uses (which
+        // this feature can't help - see its own results/notes).
+        a.setBatch((0 until 20).associate { "field$it" to axsValueOf("AAAA") })
+
+        // A few warm-up rounds so the free list settles into its steady state
+        // (the first couple of resizes necessarily still need to allocate the
+        // "other" size class for the first time).
+        repeat(3) { round ->
+            for (i in 0 until 20) a.set("field$i", if (round % 2 == 0) "BBBBBBBB" else "AAAA")
+        }
+        val sizeAfterWarmup = File(path).length()
+
+        // Alternate every field between exactly two FIXED-length values, many
+        // times over - deliberately avoids any size class ever being new by
+        // this point, isolating "does the index blob itself get reused across
+        // commits" from "does the value's byte length happen to keep changing
+        // to a class never seen before" (which the free list can't help with
+        // no matter what - see the "long write" test).
+        repeat(200) { round ->
+            for (i in 0 until 20) {
+                a.set("field$i", if (round % 2 == 0) "AAAA" else "BBBBBBBB")
+            }
+        }
+        val sizeAfterChurn = File(path).length()
+
+        val dataOk = (0 until 20).all { i -> (a.get("field$i") as? AxsString)?.value == "BBBBBBBB" }
+        a.close()
+
+        val growth = sizeAfterChurn - sizeAfterWarmup
+
+        report(
+            "index space reused under realistic (stable key set) churn",
+            dataOk && growth < 20_000,
+            "sizeAfterWarmup=${sizeAfterWarmup}B sizeAfterChurn=${sizeAfterChurn}B growth=${growth}B " +
+                    "over 4000 individual commits alternating 2 fixed value sizes " +
+                    "(unbounded reuse-free growth would be several MB) dataOk=$dataOk"
+        )
+    } catch (e: Exception) {
+        report("index space reused under realistic churn", false, "threw: $e")
+    } finally {
+        File(path).delete()
+    }
+}
+
+// ---------- 10. same-transaction free-list reuse hazard (regression test) ----------
+
+private fun testSameTransactionReuseHazard() {
+    val path = freshPath("reuse-hazard")
+    try {
+        val a = AxsFile(path)
+        a.open()
+        a.setBatch(mapOf("victim" to axsValueOf("V".repeat(200))))
+
+        val beforeBytes = File(path).readBytes().copyOf()
+
+        a.setBatch(mapOf("victim" to axsValueOf("v")))
+        val afterBytes = File(path).readBytes()
+
+        val marker = "V".repeat(200).toByteArray()
+        var origOffset = -1
+        outer@ for (i in 0..beforeBytes.size - marker.size) {
+            for (j in marker.indices) if (beforeBytes[i + j] != marker[j]) continue@outer
+            origOffset = i; break
+        }
+
+        val stillIntact = origOffset >= 0 && marker.indices.all { k ->
+            origOffset + k < afterBytes.size && afterBytes[origOffset + k] == marker[k]
+        }
+        a.close()
+
+        report(
+            "same-transaction free-list entries are never reused within that transaction",
+            origOffset >= 0 && stillIntact,
+            if (origOffset < 0) "couldn't locate victim's original bytes to check"
+            else "victim's pre-resize bytes at offset $origOffset " +
+                    (if (stillIntact) "were left untouched (safe)" else "were overwritten during the same commit that freed them (unsafe)")
+        )
+    } catch (e: Exception) {
+        report("same-transaction free-list reuse hazard", false, "threw: $e")
+    } finally {
+        File(path).delete()
+    }
+}
+
 private fun testCorruptedRead() {
     val path = freshPath("corrupt")
     val marker = "CORRUPT_ME_TARGET_VALUE_MARKER_1234567890"
@@ -378,6 +562,8 @@ private fun testCorruptedRead() {
         a.set("tags", axsValueOf(listOf(axsValueOf("kotlin"), axsValueOf("android"), axsValueOf("music"))))
         a.close()
 
+        // Forcefully corrupt the "victim" value's bytes on disk, in place -
+        // same length, so this is a pure bit-flip, not a structural change.
         val markerBytes = marker.toByteArray(Charsets.UTF_8)
         val fileBytes = File(path).readBytes()
         val idx = indexOfBytes(fileBytes, markerBytes)
