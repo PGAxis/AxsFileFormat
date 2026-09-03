@@ -246,16 +246,21 @@ class AxsFile(private val filePath: String) {
 
         return when (value) {
             is AxsObject -> {
-                if (index.find(nodeId) == null) {
+                val existed = index.find(nodeId) != null
+                if (!existed) {
                     index.add(AxsNode(id = nodeId, parentId = parentId, nodeType = NodeType.OBJECT, name = name))
-                    true
-                } else false
+                }
+                val pruned = pruneStaleChildren(index, nodeId, value.children.keys)
+                !existed || pruned
             }
             is AxsArray -> {
-                if (index.find(nodeId) == null) {
+                val existed = index.find(nodeId) != null
+                if (!existed) {
                     index.add(AxsNode(id = nodeId, parentId = parentId, nodeType = NodeType.ARRAY, name = name))
-                    true
-                } else false
+                }
+                val validIndices = (0 until value.items.size).map { it.toString() }.toHashSet()
+                val pruned = pruneStaleChildren(index, nodeId, validIndices)
+                !existed || pruned
             }
             is AxsNull -> writeValueEntry(raf, index, eligibleFreeIds, path, ByteArray(0), ValueType.NULL)
             else -> {
@@ -263,6 +268,17 @@ class AxsFile(private val filePath: String) {
                 writeValueEntry(raf, index, eligibleFreeIds, path, raw.toByteArray(Charsets.UTF_8), valueType)
             }
         }
+    }
+
+    private fun pruneStaleChildren(index: AxsIndex, parentId: Long, validNames: Set<String>): Boolean {
+        var pruned = false
+        for (child in index.childrenOf(parentId).toList()) {
+            if (child.name !in validNames) {
+                freeSubtree(index, child)
+                pruned = true
+            }
+        }
+        return pruned
     }
 
     // ---------- Binding ----------
@@ -610,6 +626,19 @@ class AxsFile(private val filePath: String) {
             else -> index.childrenOf(node.id).flatMap { collectValueNodes(index, it) }
         }
 
+    private fun freeSubtree(index: AxsIndex, node: AxsNode) {
+        for (valueNode in collectValueNodes(index, node)) {
+            index.add(
+                AxsNode(
+                    id = AxsIndex.freeId(valueNode.dataOffset), parentId = AxsIndex.FREE_LIST_ID,
+                    nodeType = NodeType.FREE, name = "",
+                    dataOffset = valueNode.dataOffset, dataSize = AXS_BLOCK_HEADER_SIZE + valueNode.dataSize
+                )
+            )
+        }
+        index.remove(node.id)
+    }
+
     // ---------- Public API ----------
 
     private fun create() {
@@ -907,16 +936,7 @@ class AxsFile(private val filePath: String) {
                             throw IllegalStateException("$path is non-empty — use recursive = true")
                     }
 
-                    for (valueNode in collectValueNodes(index, node)) {
-                        index.add(
-                            AxsNode(
-                                id = AxsIndex.freeId(valueNode.dataOffset), parentId = AxsIndex.FREE_LIST_ID,
-                                nodeType = NodeType.FREE, name = "",
-                                dataOffset = valueNode.dataOffset, dataSize = AXS_BLOCK_HEADER_SIZE + valueNode.dataSize
-                            )
-                        )
-                    }
-                    index.remove(node.id)
+                    freeSubtree(index, node)
 
                     commitIndex(raf, slotIdx, sb, index)
                 }
@@ -941,7 +961,7 @@ class AxsFile(private val filePath: String) {
                             for (node in liveIndex.all()) {
                                 if (node.id == AxsIndex.ROOT_ID) { newIndex.add(node.copy()); continue }
                                 when (node.nodeType) {
-                                    NodeType.FREE -> {}
+                                    NodeType.FREE -> {} // dropped - the whole point of defragmenting
                                     NodeType.VALUE -> {
                                         val bytes = readValueBlockOrNull(src, node.dataOffset, node.dataSize)
                                         if (bytes == null) continue // already-corrupted - drop, don't propagate

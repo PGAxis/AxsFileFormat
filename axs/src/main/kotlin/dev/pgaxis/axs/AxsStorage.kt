@@ -205,7 +205,7 @@ fun overwriteValueBlockInPlace(
 fun readValueBlockOrNull(raf: RandomAccessFile, dataOffset: Long, dataSize: Int): ByteArray? {
     return try {
         raf.seek(dataOffset + 4)
-        raf.readByte() // type - caller already knows it from the index
+        raf.readByte()
         val flags = raf.readByte()
         val storedCrc = raf.readInt()
         if (flags == AXS_FLAG_WRITING) return null

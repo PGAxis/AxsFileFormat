@@ -44,6 +44,7 @@ fun main(args: Array<String>) {
         "splitting" -> testFreeSpaceSplitting()
         "index-reuse" -> testIndexSpaceReuseBoundedGrowth()
         "reuse-hazard" -> testSameTransactionReuseHazard()
+        "prune" -> testStaleChildPruning()
         "all" -> {
             testSimpleWriteRead()
             testLongWrite()
@@ -55,9 +56,10 @@ fun main(args: Array<String>) {
             testFreeSpaceSplitting()
             testIndexSpaceReuseBoundedGrowth()
             testSameTransactionReuseHazard()
+            testStaleChildPruning()
         }
         else -> {
-            println("Unknown test '$which'. Options: simple, long, long-kill, defrag, defrag-kill, corrupt, batching, migration, splitting, index-reuse, reuse-hazard, all")
+            println("Unknown test '$which'. Options: simple, long, long-kill, defrag, defrag-kill, corrupt, batching, migration, splitting, index-reuse, reuse-hazard, prune, all")
             return
         }
     }
@@ -412,8 +414,8 @@ private fun testFreeSpaceSplitting() {
         val bigBlockFound = expectedBigBlockSpan in freeSizes
 
         // Batched into ONE commit deliberately: three separate top-level set()
-        // calls would each pay for their own index rewrite (a different, already-known
-        // cost - see the "long write" test), which would swamp the much
+        // calls would each pay for their own index rewrite (a different, already-
+        // known cost - see the "long write" test), which would swamp the much
         // smaller effect we're actually isolating here: whether the VALUE bytes
         // themselves get reused out of the freed hole instead of appended fresh.
         a.setBatch(
@@ -466,7 +468,7 @@ private fun testIndexSpaceReuseBoundedGrowth() {
 
         // Seed a modest, STABLE set of keys - this is the realistic pattern
         // (bound settings, a fixed-ish set of fields updated over time), not
-        // the "always brand-new keys" pattern the "long write" test uses (which
+        // the "always brand new keys" pattern the "long write" test uses (which
         // this feature can't help - see its own results/notes).
         a.setBatch((0 until 20).associate { "field$it" to axsValueOf("AAAA") })
 
@@ -494,6 +496,11 @@ private fun testIndexSpaceReuseBoundedGrowth() {
         val dataOk = (0 until 20).all { i -> (a.get("field$i") as? AxsString)?.value == "BBBBBBBB" }
         a.close()
 
+        // Once warmed up, every subsequent round should be cycling through the
+        // SAME two free-list entries per field (the previous round's freed
+        // block, immediately reused for this round's opposite-sized value) -
+        // growth from here should be at most the fixed per-commit index-write
+        // cost, not scaling with the 4000 individual set() calls involved.
         val growth = sizeAfterChurn - sizeAfterWarmup
 
         report(
@@ -519,8 +526,15 @@ private fun testSameTransactionReuseHazard() {
         a.open()
         a.setBatch(mapOf("victim" to axsValueOf("V".repeat(200))))
 
+        // Read victim's original 200 bytes directly off disk before the resize.
         val beforeBytes = File(path).readBytes().copyOf()
 
+        // A resize that, if the just-freed block were eligible for reuse WITHIN
+        // this same commit, would physically overwrite victim's own pre-existing
+        // bytes before this generation is safely superseded - see the design
+        // notes on why that's unsafe (a real crash between the write and the
+        // commit's flip could leave the pre-commit generation unable to read a
+        // value it never asked to have touched).
         a.setBatch(mapOf("victim" to axsValueOf("v")))
         val afterBytes = File(path).readBytes()
 
@@ -531,7 +545,7 @@ private fun testSameTransactionReuseHazard() {
             origOffset = i; break
         }
 
-        val stillIntact = origOffset >= 0 && marker.indices.all { k ->
+        val stillIntact = origOffset >= 0 && (0 until marker.size).all { k ->
             origOffset + k < afterBytes.size && afterBytes[origOffset + k] == marker[k]
         }
         a.close()
@@ -545,6 +559,40 @@ private fun testSameTransactionReuseHazard() {
         )
     } catch (e: Exception) {
         report("same-transaction free-list reuse hazard", false, "threw: $e")
+    } finally {
+        File(path).delete()
+    }
+}
+
+// ---------- 11. stale children pruned when an object/array shrinks ----------
+
+private fun testStaleChildPruning() {
+    val path = freshPath("prune")
+    try {
+        val a = AxsFile(path)
+        a.open()
+
+        a.set("list", axsValueOf(listOf(axsValueOf("A"), axsValueOf("B"), axsValueOf("C"))))
+        a.set("list", axsValueOf(listOf(axsValueOf("A"), axsValueOf("C")))) // drop the middle item
+        val listAfter = (a.get("list") as? AxsArray)?.items?.mapNotNull { (it as? AxsString)?.value }
+
+        a.set("obj", axsValueOf(mapOf("a" to axsValueOf("1"), "b" to axsValueOf("2"), "c" to axsValueOf("3"))))
+        a.set("obj", axsValueOf(mapOf("a" to axsValueOf("1"), "c" to axsValueOf("3")))) // drop key "b"
+        val objAfter = (a.get("obj") as? AxsObject)?.children?.mapValues { (it.value as? AxsString)?.value }
+
+        a.close()
+
+        val listOk = listAfter == listOf("A", "C")
+        val objOk = objAfter == mapOf("a" to "1", "c" to "3")
+
+        report(
+            "shrinking an object/array prunes stale children instead of leaking them",
+            listOk && objOk,
+            "list after removing middle item: $listAfter (want [A, C]); " +
+                    "object after removing key 'b': $objAfter (want {a=1, c=3})"
+        )
+    } catch (e: Exception) {
+        report("stale child pruning", false, "threw: $e")
     } finally {
         File(path).delete()
     }
