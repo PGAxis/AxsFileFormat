@@ -366,8 +366,14 @@ class AxsFile(private val filePath: String) {
             it?.toAxsValue() ?: throw AxsTypeMismatchException("", "null", "supported type")
         })
         is Enum<*> -> axsValueOf(this.name)
+        is java.time.LocalDateTime -> axsValueOf(this.toString())
+        is java.time.LocalDate -> axsValueOf(this.toString())
+        is java.time.LocalTime -> axsValueOf(this.toString())
+        is java.time.YearMonth -> axsValueOf(this.toString())
+        is java.time.Duration -> axsValueOf(this.toString())
         else -> {
-            val props = this::class.memberProperties
+            val constructorParamNames = this::class.primaryConstructor?.parameters?.mapNotNull { it.name }?.toSet()
+            val props = this::class.memberProperties.filter { constructorParamNames == null || it.name in constructorParamNames }
             if (props.isEmpty()) throw AxsTypeMismatchException("", this::class.simpleName ?: "unknown", "supported type")
             val children = props.associate { prop ->
                 @Suppress("UNCHECKED_CAST")
@@ -392,6 +398,11 @@ class AxsFile(private val filePath: String) {
             Short::class -> (child as? AxsShort)?.value
             Char::class -> (child as? AxsChar)?.value
             Byte::class -> (child as? AxsByte)?.value
+            java.time.LocalDateTime::class -> (child as? AxsString)?.value?.let { java.time.LocalDateTime.parse(it) }
+            java.time.LocalDate::class -> (child as? AxsString)?.value?.let { java.time.LocalDate.parse(it) }
+            java.time.LocalTime::class -> (child as? AxsString)?.value?.let { java.time.LocalTime.parse(it) }
+            java.time.YearMonth::class -> (child as? AxsString)?.value?.let { java.time.YearMonth.parse(it) }
+            java.time.Duration::class -> (child as? AxsString)?.value?.let { java.time.Duration.parse(it) }
             List::class -> {
                 val itemType = type.arguments.firstOrNull()?.type ?: return null
                 (child as? AxsArray)?.items?.mapNotNull { item ->
