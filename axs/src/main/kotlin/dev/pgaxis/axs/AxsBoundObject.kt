@@ -3,7 +3,6 @@ package dev.pgaxis.axs
 import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.KProperty1
 import kotlin.reflect.full.memberProperties
-import kotlin.reflect.full.primaryConstructor
 
 class AxsBoundObject<T : Any>(
     private val file: AxsFile,
@@ -19,7 +18,10 @@ class AxsBoundObject<T : Any>(
         if (!file.isOpen()) throw AxsFileNotOpenException(className)
         prop.set(instance, value)
 
-        writeQueue.enqueue("$className.${prop.name}", value.toAxsCompatibleValue())
+        try {
+            writeQueue.enqueue("$className.${prop.name}", value.toAxsCompatibleValue())
+        } catch (_: Exception) { }
+        catch (_: LinkageError) { }
     }
 
     fun flush() {
@@ -40,14 +42,8 @@ class AxsBoundObject<T : Any>(
         is Byte -> axsValueOf(this)
         is List<*> -> AxsArray(this.map { it?.toAxsCompatibleValue() ?: AxsNull })
         is Enum<*> -> axsValueOf(this.name)
-        is java.time.LocalDateTime -> axsValueOf(this.toString())
-        is java.time.LocalDate -> axsValueOf(this.toString())
-        is java.time.LocalTime -> axsValueOf(this.toString())
-        is java.time.YearMonth -> axsValueOf(this.toString())
-        is java.time.Duration -> axsValueOf(this.toString())
         else -> {
-            val constructorParamNames = this::class.primaryConstructor?.parameters?.mapNotNull { it.name }?.toSet()
-            val props = this::class.memberProperties.filter { constructorParamNames == null || it.name in constructorParamNames }
+            val props = this::class.memberProperties
             if (props.isEmpty()) throw AxsTypeMismatchException(className, this::class.simpleName ?: "unknown", "supported type")
             val children = props.associate { prop ->
                 @Suppress("UNCHECKED_CAST")

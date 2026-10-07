@@ -61,6 +61,19 @@ class AxsFile(private val filePath: String) {
         isFileOpen = true
     }
 
+    /**
+     * One-time migration from the v4 on-disk format (single header, pointing at
+     * one index blob, no dual-superblock/COW) to v5. Only the *header* scheme
+     * changed between the two formats - individual value blocks and the index's
+     * own node encoding are byte-identical, so this is a straight copy of every
+     * node into a fresh v5 file, not a text-based export/import round-trip.
+     *
+     * Uses a tmp file + rename, same as defragment().
+     *
+     * A value block that already fails its own CRC in the old file is dropped
+     * (same "recover what you can" rule as everywhere else) rather than
+     * blocking migration of everything else.
+     */
     private fun migrateFromLegacyV4() {
         val legacyIndex = AxsIndex()
         val looksLikeLegacy = RandomAccessFile(filePath, "r").use { raf ->
@@ -153,6 +166,12 @@ class AxsFile(private val filePath: String) {
         return index
     }
 
+    /**
+     * Commits a structural change, threading through the superblock's fixed
+     * "reuse hint" fields so the index blob itself can be placed into the
+     * space its own predecessor freed, without ever growing the index to
+     * describe that fact (see AxsSuperblock's doc comment).
+     */
     private fun commitIndex(
         raf: RandomAccessFile,
         currentSlot: Int,
@@ -166,6 +185,7 @@ class AxsFile(private val filePath: String) {
         )
     }
 
+    /** Free-block ids safe to reuse in the transaction about to be built on top of `index`. */
     private fun eligibleFreeIdsOf(index: AxsIndex): Set<Long> =
         index.freeBlocks().map { it.id }.toHashSet()
 
@@ -174,6 +194,11 @@ class AxsFile(private val filePath: String) {
         return if (segments.size > 1) AxsIndex.hashPath(segments.dropLast(1).joinToString(".")) else AxsIndex.ROOT_ID
     }
 
+    /**
+     * Writes one leaf value. Returns true if the index/superblock had to change
+     * (caller must commitIndex), false if it was a same-size in-place overwrite
+     * that's already fully durable on its own.
+     */
     private fun writeValueEntry(
         raf: RandomAccessFile,
         index: AxsIndex,
@@ -238,6 +263,7 @@ class AxsFile(private val filePath: String) {
         return true
     }
 
+    /** Writes one entry of a bulk tree (see setBulk/collectEntries) into an already-open transaction. */
     private fun writeEntry(raf: RandomAccessFile, index: AxsIndex, eligibleFreeIds: Set<Long>, path: String, value: AxsValue): Boolean {
         ensureParentNodes(index, path)
         val nodeId = AxsIndex.hashPath(path)
@@ -258,7 +284,7 @@ class AxsFile(private val filePath: String) {
                 if (!existed) {
                     index.add(AxsNode(id = nodeId, parentId = parentId, nodeType = NodeType.ARRAY, name = name))
                 }
-                val validIndices = (0 until value.items.size).map { it.toString() }.toHashSet()
+                val validIndices = value.items.indices.map { it.toString() }.toHashSet()
                 val pruned = pruneStaleChildren(index, nodeId, validIndices)
                 !existed || pruned
             }
@@ -270,6 +296,7 @@ class AxsFile(private val filePath: String) {
         }
     }
 
+    /** Frees and removes any existing child of `parentId` whose name isn't in `validNames`. */
     private fun pruneStaleChildren(index: AxsIndex, parentId: Long, validNames: Set<String>): Boolean {
         var pruned = false
         for (child in index.childrenOf(parentId).toList()) {
@@ -295,54 +322,64 @@ class AxsFile(private val filePath: String) {
             if (LOGGING) println("[AxsBind] No existing data, writing defaults")
             createObject(className)
             for (prop in instance::class.memberProperties) {
-                @Suppress("UNCHECKED_CAST")
-                val value = (prop as KProperty1<T, *>).get(instance)
-                if (LOGGING) println("[AxsBind] Writing default ${prop.name} = $value")
-                set("$className.${prop.name}", value?.toAxsValue() ?: AxsNull)
+                try {
+                    @Suppress("UNCHECKED_CAST")
+                    val value = (prop as KProperty1<T, *>).get(instance)
+                    if (LOGGING) println("[AxsBind] Writing default ${prop.name} = $value")
+                    set("$className.${prop.name}", value?.toAxsValue() ?: AxsNull)
+                } catch (e: Exception) {
+                    if (LOGGING) println("[AxsBind] Skipping ${prop.name}: $e")
+                } catch (e: LinkageError) {
+                    if (LOGGING) println("[AxsBind] Skipping ${prop.name}: $e")
+                }
             }
         } else {
             if (LOGGING) println("[AxsBind] Found existing data, restoring properties")
             val saved = existing as? AxsObject
             saved?.let {
                 for (prop in instance::class.memberProperties.filterIsInstance<KMutableProperty1<T, *>>()) {
-                    if (LOGGING) println("[AxsBind] Restoring ${prop.name} (type: ${prop.returnType})")
-                    val key = prop.name
-                    val axsValue = it.children[key] ?: continue
+                    try {
+                        if (LOGGING) println("[AxsBind] Restoring ${prop.name} (type: ${prop.returnType})")
+                        val key = prop.name
+                        val axsValue = it.children[key] ?: continue
 
-                    if (axsValue is AxsNull) {
-                        if (prop.returnType.isMarkedNullable) {
-                            @Suppress("UNCHECKED_CAST")
-                            (prop as KMutableProperty1<T, Any?>).set(instance, null)
-                        }
-                        continue
-                    }
-
-                    if (LOGGING) println("[AxsBind] raw value: $axsValue")
-                    val converted: Any? = when (prop.returnType.classifier) {
-                        String::class -> (axsValue as? AxsString)?.value
-                        Int::class -> (axsValue as? AxsInt)?.value
-                        Float::class -> (axsValue as? AxsFloat)?.value
-                        Double::class -> (axsValue as? AxsDouble)?.value
-                        Boolean::class -> (axsValue as? AxsBool)?.value
-                        Long::class -> (axsValue as? AxsLong)?.value
-                        Short::class -> (axsValue as? AxsShort)?.value
-                        Char::class -> (axsValue as? AxsChar)?.value
-                        Byte::class -> (axsValue as? AxsByte)?.value
-                        List::class -> {
-                            val itemType = prop.returnType.arguments.firstOrNull()?.type ?: return@let
-                            (axsValue as? AxsArray)?.items?.mapNotNull { item ->
-                                try { reconstructValue(item, itemType) }
-                                catch (_: Exception) { null }
+                        if (axsValue is AxsNull) {
+                            if (prop.returnType.isMarkedNullable) {
+                                @Suppress("UNCHECKED_CAST")
+                                (prop as KMutableProperty1<T, Any?>).set(instance, null)
                             }
+                            continue
                         }
-                        else -> {
-                            try { reconstructValue(axsValue, prop.returnType) }
-                            catch (_: Exception) { continue }
+
+                        if (LOGGING) println("[AxsBind] raw value: $axsValue")
+                        val converted: Any? = when (prop.returnType.classifier) {
+                            String::class -> (axsValue as? AxsString)?.value
+                            Int::class -> (axsValue as? AxsInt)?.value
+                            Float::class -> (axsValue as? AxsFloat)?.value
+                            Double::class -> (axsValue as? AxsDouble)?.value
+                            Boolean::class -> (axsValue as? AxsBool)?.value
+                            Long::class -> (axsValue as? AxsLong)?.value
+                            Short::class -> (axsValue as? AxsShort)?.value
+                            Char::class -> (axsValue as? AxsChar)?.value
+                            Byte::class -> (axsValue as? AxsByte)?.value
+                            List::class -> {
+                                val itemType = prop.returnType.arguments.firstOrNull()?.type ?: return@let
+                                (axsValue as? AxsArray)?.items?.mapNotNull { item ->
+                                    try { reconstructValue(item, itemType) }
+                                    catch (_: Exception) { null }
+                                    catch (_: LinkageError) { null }
+                                }
+                            }
+                            else -> reconstructValue(axsValue, prop.returnType)
                         }
-                    }
-                    if (converted != null) {
-                        @Suppress("UNCHECKED_CAST")
-                        (prop as KMutableProperty1<T, Any>).set(instance, converted)
+                        if (converted != null) {
+                            @Suppress("UNCHECKED_CAST")
+                            (prop as KMutableProperty1<T, Any>).set(instance, converted)
+                        }
+                    } catch (e: Exception) {
+                        if (LOGGING) println("[AxsBind] Failed to restore ${prop.name}, keeping default: $e")
+                    } catch (e: LinkageError) {
+                        if (LOGGING) println("[AxsBind] Failed to restore ${prop.name}, keeping default: $e")
                     }
                 }
             }
@@ -351,7 +388,7 @@ class AxsFile(private val filePath: String) {
         return AxsBoundObject(this, instance, className, writeQueue)
     }
 
-    // ---------- Private helpers (format-independent - unchanged from before) ----------
+    // ---------- Private helpers ----------
     private fun Any.toAxsValue(): AxsValue = when (this) {
         is String -> axsValueOf(this)
         is Int -> axsValueOf(this)
@@ -366,19 +403,33 @@ class AxsFile(private val filePath: String) {
             it?.toAxsValue() ?: throw AxsTypeMismatchException("", "null", "supported type")
         })
         is Enum<*> -> axsValueOf(this.name)
-        is java.time.LocalDateTime -> axsValueOf(this.toString())
-        is java.time.LocalDate -> axsValueOf(this.toString())
-        is java.time.LocalTime -> axsValueOf(this.toString())
-        is java.time.YearMonth -> axsValueOf(this.toString())
-        is java.time.Duration -> axsValueOf(this.toString())
         else -> {
-            val constructorParamNames = this::class.primaryConstructor?.parameters?.mapNotNull { it.name }?.toSet()
-            val props = this::class.memberProperties.filter { constructorParamNames == null || it.name in constructorParamNames }
-            if (props.isEmpty()) throw AxsTypeMismatchException("", this::class.simpleName ?: "unknown", "supported type")
-            val children = props.associate { prop ->
-                @Suppress("UNCHECKED_CAST")
-                val value = (prop as KProperty1<Any, *>).get(this)
-                prop.name to (value?.toAxsValue() ?: AxsNull)
+            val kClass = this::class
+            if (!kClass.isData) {
+                throw AxsTypeMismatchException(
+                    "", kClass.qualifiedName ?: kClass.simpleName ?: "unknown",
+                    "a primitive, String, List, enum, or your own data class"
+                )
+            }
+            val children = try {
+                kClass.memberProperties.associate { prop ->
+                    @Suppress("UNCHECKED_CAST")
+                    val value = (prop as KProperty1<Any, *>).get(this)
+                    prop.name to (value?.toAxsValue() ?: AxsNull)
+                }
+            } catch (e: Exception) {
+                throw AxsTypeMismatchException(
+                    "", kClass.qualifiedName ?: kClass.simpleName ?: "unknown",
+                    "a fully reflectable data class (${e.message})"
+                )
+            } catch (e: LinkageError) {
+                throw AxsTypeMismatchException(
+                    "", kClass.qualifiedName ?: kClass.simpleName ?: "unknown",
+                    "a type fully available on this platform (${e.message})"
+                )
+            }
+            if (children.isEmpty()) {
+                throw AxsTypeMismatchException("", kClass.simpleName ?: "unknown", "supported type")
             }
             AxsObject(children)
         }
@@ -398,11 +449,6 @@ class AxsFile(private val filePath: String) {
             Short::class -> (child as? AxsShort)?.value
             Char::class -> (child as? AxsChar)?.value
             Byte::class -> (child as? AxsByte)?.value
-            java.time.LocalDateTime::class -> (child as? AxsString)?.value?.let { java.time.LocalDateTime.parse(it) }
-            java.time.LocalDate::class -> (child as? AxsString)?.value?.let { java.time.LocalDate.parse(it) }
-            java.time.LocalTime::class -> (child as? AxsString)?.value?.let { java.time.LocalTime.parse(it) }
-            java.time.YearMonth::class -> (child as? AxsString)?.value?.let { java.time.YearMonth.parse(it) }
-            java.time.Duration::class -> (child as? AxsString)?.value?.let { java.time.Duration.parse(it) }
             List::class -> {
                 val itemType = type.arguments.firstOrNull()?.type ?: return null
                 (child as? AxsArray)?.items?.mapNotNull { item ->
@@ -419,16 +465,29 @@ class AxsFile(private val filePath: String) {
                     } else {
                         val obj = child as? AxsObject ?: return null
                         val constructor = classifier.primaryConstructor ?: return null
-                        val args = constructor.parameters.associateWith { param ->
-                            val paramChild = obj.children[param.name]
-                            if (paramChild == null || paramChild is AxsNull) {
-                                if (param.type.isMarkedNullable) return@associateWith null
-                                else return@associateWith null // will use default if available
+                        val args = try {
+                            constructor.parameters.associateWith { param ->
+                                val paramChild = obj.children[param.name]
+                                if (paramChild == null || paramChild is AxsNull) {
+                                    if (param.type.isMarkedNullable) return@associateWith null
+                                    else return@associateWith null
+                                }
+                                try { reconstructValue(paramChild, param.type) }
+                                catch (_: Exception) { null }
+                                catch (_: LinkageError) { null }
                             }
-                            try { reconstructValue(paramChild, param.type) }
-                            catch (_: Exception) { null }
+                        } catch (_: Exception) {
+                            return null
+                        } catch (_: LinkageError) {
+                            return null
                         }
-                        constructor.callBy(args)
+                        try {
+                            constructor.callBy(args)
+                        } catch (_: Exception) {
+                            null
+                        } catch (_: LinkageError) {
+                            null
+                        }
                     }
                 } else null
             }
@@ -471,6 +530,13 @@ class AxsFile(private val filePath: String) {
         )
     }
 
+    /**
+     * Reads a node, degrading gracefully instead of throwing: a value block that's
+     * mid-write or fails its CRC becomes AxsNull (-> caller's default) rather than
+     * failing the whole read. A corrupted item inside a List just gets dropped by
+     * the mapNotNull in bind()/reconstructValue - everything else in the tree is
+     * unaffected.
+     */
     private fun readNode(
         raf: RandomAccessFile,
         index: AxsIndex,
@@ -518,25 +584,25 @@ class AxsFile(private val filePath: String) {
     }
 
     private fun dumpNode(raf: RandomAccessFile, index: AxsIndex, parentId: Long, dir: File) {
-        for (node in index.childrenOf(parentId)) {
-            when (node.nodeType) {
+        for ((id, _, nodeType, name, dataOffset, dataSize, valueType) in index.childrenOf(parentId)) {
+            when (nodeType) {
                 NodeType.OBJECT -> {
-                    val subDir = File(dir, node.name)
+                    val subDir = File(dir, name)
                     subDir.mkdirs()
-                    dumpNode(raf, index, node.id, subDir)
+                    dumpNode(raf, index, id, subDir)
                 }
 
                 NodeType.ARRAY -> {
-                    val subDir = File(dir, node.name)
+                    val subDir = File(dir, name)
                     subDir.mkdirs()
                     File(subDir, "_array").createNewFile()
-                    dumpNode(raf, index, node.id, subDir)
+                    dumpNode(raf, index, id, subDir)
                 }
 
                 NodeType.VALUE -> {
-                    val dataBytes = readValueBlockOrNull(raf, node.dataOffset, node.dataSize)
-                    val typeName = node.valueType.name.lowercase()
-                    File(dir, "${node.name}.$typeName.txt").writeText(
+                    val dataBytes = readValueBlockOrNull(raf, dataOffset, dataSize)
+                    val typeName = valueType.name.lowercase()
+                    File(dir, "$name.$typeName.txt").writeText(
                         dataBytes?.let { String(it, Charsets.UTF_8) } ?: ""
                     )
                 }
@@ -637,13 +703,17 @@ class AxsFile(private val filePath: String) {
             else -> index.childrenOf(node.id).flatMap { collectValueNodes(index, it) }
         }
 
+    /**
+     * Frees every VALUE block under `node` (including `node` itself if it is
+     * one) and removes the whole subtree from the index.
+     */
     private fun freeSubtree(index: AxsIndex, node: AxsNode) {
-        for (valueNode in collectValueNodes(index, node)) {
+        for ((_, _, _, _, dataOffset, dataSize) in collectValueNodes(index, node)) {
             index.add(
                 AxsNode(
-                    id = AxsIndex.freeId(valueNode.dataOffset), parentId = AxsIndex.FREE_LIST_ID,
+                    id = AxsIndex.freeId(dataOffset), parentId = AxsIndex.FREE_LIST_ID,
                     nodeType = NodeType.FREE, name = "",
-                    dataOffset = valueNode.dataOffset, dataSize = AXS_BLOCK_HEADER_SIZE + valueNode.dataSize
+                    dataOffset = dataOffset, dataSize = AXS_BLOCK_HEADER_SIZE + dataSize
                 )
             )
         }
@@ -707,7 +777,7 @@ class AxsFile(private val filePath: String) {
                     val free = index.freeBlocks()
                     if (free.isNotEmpty()) {
                         result.add("=== Free list (${free.size} blocks) ===")
-                        for (node in free) result.add("offset=${node.dataOffset} size=${node.dataSize}")
+                        for ((_, _, _, _, dataOffset, dataSize) in free) result.add("offset=$dataOffset size=$dataSize")
                     }
 
                     result
@@ -716,6 +786,7 @@ class AxsFile(private val filePath: String) {
         }
     }
 
+    /** Low-level primitive setter - used directly by callers that already know the ValueType. */
     fun set(path: String, value: String, valueType: ValueType = ValueType.STRING) {
         checkOpen()
         runBlocking {
@@ -812,6 +883,10 @@ class AxsFile(private val filePath: String) {
         }
     }
 
+    /**
+     * Writes many independent paths as ONE commit - unlike setAll(), this is a
+     * partial update: anything not in `values` is left completely untouched.
+     */
     fun setBatch(values: Map<String, AxsValue>) {
         if (values.isEmpty()) return
         checkOpen()
@@ -955,6 +1030,13 @@ class AxsFile(private val filePath: String) {
         }
     }
 
+    /**
+     * Rewrites the file from scratch, compacted: every live value packed with no
+     * gaps, the free list emptied, file size shrunk to what's actually live.
+     *
+     * A value block that's already unrecoverable (mid-write/CRC-failed before you
+     * even called this) is dropped rather than propagated into the compacted file.
+     */
     fun defragment() {
         checkOpen()
         runBlocking {
