@@ -45,6 +45,7 @@ fun main(args: Array<String>) {
         "index-reuse" -> testIndexSpaceReuseBoundedGrowth()
         "reuse-hazard" -> testSameTransactionReuseHazard()
         "prune" -> testStaleChildPruning()
+        "unsupported" -> testUnsupportedTypesDegradeGracefully()
         "all" -> {
             testSimpleWriteRead()
             testLongWrite()
@@ -57,9 +58,10 @@ fun main(args: Array<String>) {
             testIndexSpaceReuseBoundedGrowth()
             testSameTransactionReuseHazard()
             testStaleChildPruning()
+            testUnsupportedTypesDegradeGracefully()
         }
         else -> {
-            println("Unknown test '$which'. Options: simple, long, long-kill, defrag, defrag-kill, corrupt, batching, migration, splitting, index-reuse, reuse-hazard, prune, all")
+            println("Unknown test '$which'. Options: simple, long, long-kill, defrag, defrag-kill, corrupt, batching, migration, splitting, index-reuse, reuse-hazard, prune, unsupported, all")
             return
         }
     }
@@ -545,7 +547,7 @@ private fun testSameTransactionReuseHazard() {
             origOffset = i; break
         }
 
-        val stillIntact = origOffset >= 0 && (0 until marker.size).all { k ->
+        val stillIntact = origOffset >= 0 && marker.indices.all { k ->
             origOffset + k < afterBytes.size && afterBytes[origOffset + k] == marker[k]
         }
         a.close()
@@ -593,6 +595,49 @@ private fun testStaleChildPruning() {
         )
     } catch (e: Exception) {
         report("stale child pruning", false, "threw: $e")
+    } finally {
+        File(path).delete()
+    }
+}
+
+// ---------- 12. unsupported (non-data-class) property types degrade instead of crashing ----------
+
+// Must be public top-level for Kotlin reflection to reach them from the library.
+class PlainNonDataClass(val x: Int = 1) // deliberately NOT a data class
+data class MixedSettings(
+    var volume: Int = 5,
+    var weird: PlainNonDataClass = PlainNonDataClass(),
+    var name: String = "default"
+)
+
+private fun testUnsupportedTypesDegradeGracefully() {
+    val path = freshPath("unsupported")
+    try {
+        val a = AxsFile(path)
+        a.open()
+        val bound = a.bind(MixedSettings()) // must not throw despite `weird`
+        bound.setValue(MixedSettings::volume, 9)
+        bound.setValue(MixedSettings::weird, PlainNonDataClass(2)) // must not throw either
+        bound.setValue(MixedSettings::name, "changed")
+        bound.flush()
+        a.close()
+
+        val b = AxsFile(path)
+        b.open()
+        val restored = MixedSettings()
+        b.bind(restored)
+        b.close()
+
+        // The supported properties around the unsupported one must be unaffected.
+        val ok = restored.volume == 9 && restored.name == "changed" && restored.weird.x == 1
+        report(
+            "unsupported property type is skipped; sibling properties still persist",
+            ok,
+            "volume=${restored.volume} name=${restored.name} weird.x=${restored.weird.x} " +
+                    "(want 9 / changed / 1 - weird keeps its default, nothing crashes)"
+        )
+    } catch (t: Throwable) {
+        report("unsupported property type degrades gracefully", false, "threw: $t")
     } finally {
         File(path).delete()
     }

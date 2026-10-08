@@ -1054,10 +1054,13 @@ class AxsFile(private val filePath: String) {
                             for (node in liveIndex.all()) {
                                 if (node.id == AxsIndex.ROOT_ID) { newIndex.add(node.copy()); continue }
                                 when (node.nodeType) {
-                                    NodeType.FREE -> {} // dropped - the whole point of defragmenting
+                                    NodeType.FREE -> {}
                                     NodeType.VALUE -> {
-                                        val bytes = readValueBlockOrNull(src, node.dataOffset, node.dataSize)
-                                        if (bytes == null) continue // already-corrupted - drop, don't propagate
+                                        val bytes = readValueBlockOrNull(
+                                            src,
+                                            node.dataOffset,
+                                            node.dataSize
+                                        ) ?: continue
                                         appendValueBlock(dst, cursor, bytes, node.valueType)
                                         newIndex.add(node.copy(dataOffset = cursor, dataSize = bytes.size))
                                         cursor += AXS_BLOCK_HEADER_SIZE + bytes.size

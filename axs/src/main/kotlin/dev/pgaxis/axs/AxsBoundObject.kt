@@ -43,12 +43,32 @@ class AxsBoundObject<T : Any>(
         is List<*> -> AxsArray(this.map { it?.toAxsCompatibleValue() ?: AxsNull })
         is Enum<*> -> axsValueOf(this.name)
         else -> {
-            val props = this::class.memberProperties
-            if (props.isEmpty()) throw AxsTypeMismatchException(className, this::class.simpleName ?: "unknown", "supported type")
-            val children = props.associate { prop ->
-                @Suppress("UNCHECKED_CAST")
-                val value = (prop as KProperty1<Any, *>).get(this)
-                prop.name to (value?.toAxsCompatibleValue() ?: AxsNull)
+            val kClass = this::class
+            if (!kClass.isData) {
+                throw AxsTypeMismatchException(
+                    className, kClass.qualifiedName ?: kClass.simpleName ?: "unknown",
+                    "a primitive, String, List, enum, or your own data class"
+                )
+            }
+            val children = try {
+                kClass.memberProperties.associate { prop ->
+                    @Suppress("UNCHECKED_CAST")
+                    val value = (prop as KProperty1<Any, *>).get(this)
+                    prop.name to (value?.toAxsCompatibleValue() ?: AxsNull)
+                }
+            } catch (e: Exception) {
+                throw AxsTypeMismatchException(
+                    className, kClass.qualifiedName ?: kClass.simpleName ?: "unknown",
+                    "a fully reflectable data class (${e.message})"
+                )
+            } catch (e: LinkageError) {
+                throw AxsTypeMismatchException(
+                    className, kClass.qualifiedName ?: kClass.simpleName ?: "unknown",
+                    "a type fully available on this platform (${e.message})"
+                )
+            }
+            if (children.isEmpty()) {
+                throw AxsTypeMismatchException(className, kClass.simpleName ?: "unknown", "supported type")
             }
             AxsObject(children)
         }
