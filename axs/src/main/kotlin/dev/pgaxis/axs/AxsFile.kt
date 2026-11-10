@@ -20,6 +20,9 @@ class AxsFile(private val filePath: String) {
     private val fileMutex = Mutex()
     private var LOGGING = false
 
+    private val MIN_WASTE_BYTES = 64L * 1024
+    private val WASTE_PERCENT = 25
+
     companion object {
         private val queues = ConcurrentHashMap<String, WriteQueue>()
 
@@ -52,13 +55,30 @@ class AxsFile(private val filePath: String) {
             migrateFromLegacyV4()
         }
 
-        RandomAccessFile(filePath, "r").use { raf ->
+        val (index, sb) = RandomAccessFile(filePath, "r").use { raf ->
             val active = AxsSuperblock.pickActive(raf, MAGIC)
                 ?: throw AxsFileCorruptException(filePath, "both superblock slots are invalid")
-            loadIndex(raf, active.second)
+            loadIndex(raf, active.second) to active.second
         }
 
         isFileOpen = true
+
+        if (shouldDefragment(index, sb)) defragment()
+    }
+
+    private fun shouldDefragment(index: AxsIndex, sb: AxsSuperblock): Boolean {
+        val fileLength = File(filePath).length()
+        if (fileLength == 0L) return false
+
+        val liveBlocks = index.all()
+            .filter { it.nodeType == NodeType.VALUE }
+            .sumOf { AXS_BLOCK_HEADER_SIZE.toLong() + it.dataSize }
+
+        // What a freshly defragmented file would occupy
+        val liveBytes = AXS_DATA_START + liveBlocks + sb.indexLength
+        val waste = fileLength - liveBytes
+
+        return waste >= MIN_WASTE_BYTES && waste * 100 / fileLength >= WASTE_PERCENT
     }
 
     /**
